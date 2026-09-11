@@ -1,0 +1,8 @@
+aiohttp>=3.9,<4
+numpy>=1.24
+opencv-python-headless>=4.8,<5
+
+# On-device fire and smoke detection (needed only when running with DETECTOR=1).
+# ultralytics pulls in PyTorch, which is a large install on a Raspberry Pi.
+ultralytics>=8.3
+huggingface_hub>=0.24

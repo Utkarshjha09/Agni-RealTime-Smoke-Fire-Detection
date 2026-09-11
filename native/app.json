@@ -1,0 +1,42 @@
+{
+  "expo": {
+    "name": "Agni",
+    "slug": "agni",
+    "owner": "utkarshjha18",
+    "version": "1.0.0",
+    "scheme": "agni",
+    "icon": "./assets/agni-app-icon.png",
+    "orientation": "default",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#0B0F1A",
+    "ios": {
+      "supportsTablet": true,
+      "requireFullScreen": true
+    },
+    "android": {
+      "screenOrientation": "unspecified",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/agni-app-icon.png",
+        "backgroundColor": "#0B0F1A"
+      },
+      "package": "com.nature21.agni"
+    },
+    "plugins": [
+      "expo-font",
+      "expo-asset",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "kotlinVersion": "1.9.25"
+          }
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "ffe6edc8-a8bd-4839-b7f0-7f70f64e9511"
+      }
+    }
+  }
+}

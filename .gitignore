@@ -1,0 +1,107 @@
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+node_modules/
+.pnp
+.pnp.js
+.yarn/
+.npm/
+
+# ---------------------------------------------------------------------------
+# Expo / React Native build output (native/)
+# ---------------------------------------------------------------------------
+.expo/
+.expo-shared/
+.expo-export/
+dist/
+build/
+web-build/
+android/
+ios/
+*.tsbuildinfo
+.metro-health-check*
+.eas-build-local/
+
+# Signing material and per-install service config — never commit
+*.jks
+*.keystore
+*.p8
+*.p12
+*.key
+*.mobileprovision
+google-services.json
+GoogleService-Info.plist
+
+# ---------------------------------------------------------------------------
+# Python (raspberry_pi/ service, model/ training)
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.Python
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# ---------------------------------------------------------------------------
+# Model: datasets, training runs and weights are build inputs/outputs.
+# The rover downloads pretrained weights on its own — nothing here is vendored.
+# ---------------------------------------------------------------------------
+model/data/
+model/datasets/
+model/runs/
+model/weights/
+runs/
+wandb/
+
+# Weight and export formats, wherever they land
+*.pt
+*.pth
+*.onnx
+*.tflite
+*.engine
+*.param
+*.bin
+*_ncnn_model/
+
+# ---------------------------------------------------------------------------
+# Secrets and local config (ROVER_TOKEN, ROBOFLOW_API_KEY, …)
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+secrets.json
+*.pem
+
+# ---------------------------------------------------------------------------
+# Logs and temporary files
+# ---------------------------------------------------------------------------
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*-debug.log*
+.cache/
+.tmp-*
+tmp/
+.claude-replay.*
+
+# ---------------------------------------------------------------------------
+# Editors and OS noise
+# ---------------------------------------------------------------------------
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini

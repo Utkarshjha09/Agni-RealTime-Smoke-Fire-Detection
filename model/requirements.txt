@@ -1,0 +1,10 @@
+# Training-only dependencies. These are NOT needed on the rover -- the Pi only
+# needs raspberry_pi/requirements.txt plus the exported weights.
+ultralytics>=8.3
+roboflow>=1.1
+pyyaml>=6
+
+# PyTorch is intentionally NOT pinned here. Install it first for your hardware:
+#   NVIDIA GPU:  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#   CPU only:    pip install torch torchvision
+# Training on CPU is not practical for this dataset. See README.md.

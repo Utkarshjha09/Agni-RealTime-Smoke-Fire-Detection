@@ -1,0 +1,11 @@
+# The dataset is ~1 GB and is fetched from Roboflow, not stored here.
+data/
+# Training runs: checkpoints, plots, and weights are build output.
+runs/
+# Base weights ultralytics downloads on first train.
+yolo11*.pt
+*_ncnn_model/
+*.onnx
+*.torchscript
+# Pretrained weights downloaded by fetch_pretrained.py.
+weights/
