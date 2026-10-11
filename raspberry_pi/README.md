@@ -8,9 +8,9 @@ It exposes:
 
 | Endpoint | Purpose | Auth |
 |---|---|---|
-| `GET /stream.mjpg` | continuous MJPEG video at `STREAM_FPS`; what the app shows | token |
+| `GET /stream.mjpg` | continuous MJPEG video; `?overlay=1` draws the detection boxes onto it | ticket or token |
 | `GET /frame.jpg` | one JPEG frame from the camera | token |
-| `GET /control` | WebSocket: drive, brake, devices, settings, telemetry, detections, range | token |
+| `GET /control` | WebSocket: drive, brake, devices, settings, telemetry, detections, range | challenge-response, then signed messages |
 | `POST /detections` | publish a detection from an external detector | token |
 | `GET /status` | liveness probe (no camera content, no control) | open |
 
@@ -88,9 +88,19 @@ in the app's **Settings → Access token**:
 ROVER_TOKEN=$(openssl rand -hex 16) python3 rover_server.py
 ```
 
-Without `ROVER_TOKEN` the service prints a warning and runs open — anyone on the
+Without `ROVER_TOKEN` the service prints a warning and runs open: anyone on the
 network could drive the rover or publish fake fire alerts. Only do that on an
 isolated bench network.
+
+With a token, the app never sends it. `security.py` holds the protocol: the app
+answers an HMAC-SHA256 challenge, the rover proves it holds the token too, and
+every control message after that is numbered and signed with a key for that
+connection alone, so captured, replayed or injected packets are refused. Video
+opens with one-time tickets issued over that socket. Ten failed attempts lock an
+address out for a minute. One device drives at a time; BRAKE works from any.
+`verify_rover.py` attacks a live rover each of these ways and reports the result.
+What it does not do: encrypt the video, or stop someone jamming the Wi-Fi. The
+main README's Security section has the details and the Pi hardening steps.
 
 ## Connect the app
 

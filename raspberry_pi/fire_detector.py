@@ -69,6 +69,33 @@ class Track:
     last_seen: float = field(default_factory=time.monotonic)
 
 
+def limit_ncnn_threads() -> None:
+    """Make every NCNN network start with DETECT_THREADS threads.
+
+    NCNN fixes the thread count of its convolution layers when a model loads.
+    Changing it afterwards, the only place ultralytics leaves open, left the heavy
+    layers on all four cores and printed a warning on every layer of every pass:
+    61,000 log lines in ten minutes on a Pi 4. ultralytics creates the network
+    itself, so the class it creates is swapped for one that starts limited.
+    """
+    try:
+        import ncnn
+    except ImportError:
+        return  # Not an NCNN model, or ncnn missing; nothing to limit.
+    if getattr(ncnn.Net, "_agni_threads", None) == DETECT_THREADS:
+        return
+    base = ncnn.Net
+
+    class ThreadLimitedNet(base):  # type: ignore[misc, valid-type]
+        _agni_threads = DETECT_THREADS
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.opt.num_threads = DETECT_THREADS
+
+    ncnn.Net = ThreadLimitedNet
+
+
 class DetectorUnavailable(RuntimeError):
     """Raised when ultralytics or the weights could not be loaded."""
 
@@ -121,6 +148,7 @@ class FireDetector:
             ) from error
 
         self.weights_path = self.resolve_weights()
+        limit_ncnn_threads()
         self.model = YOLO(self.weights_path)
         raw_names = getattr(self.model, "names", {}) or {}
         self.names = {int(key): str(value) for key, value in raw_names.items()} if isinstance(raw_names, dict) else dict(enumerate(map(str, raw_names)))
@@ -144,17 +172,6 @@ class FireDetector:
         self._tracks.append(track)
         return track.id
 
-    def _limit_ncnn_threads(self) -> None:
-        """Cap NCNN's threads. ultralytics never sets them, so NCNN takes every core.
-
-        The network only exists once the first predict() has built the predictor;
-        NCNN reads the option on each pass, so setting it then takes effect.
-        """
-        predictor = getattr(self.model, "predictor", None)
-        net = getattr(getattr(getattr(predictor, "model", None), "backend", None), "net", None)
-        if net is not None and net.opt.num_threads != DETECT_THREADS:
-            net.opt.num_threads = DETECT_THREADS
-
     def _expire_tracks(self, now: float) -> None:
         self._tracks = [track for track in self._tracks if now - track.last_seen <= TRACK_TTL]
 
@@ -176,7 +193,6 @@ class FireDetector:
             verbose=False,
         )
         self.last_inference_ms = round((time.perf_counter() - started) * 1000, 1)
-        self._limit_ncnn_threads()
 
         now = time.monotonic()
         self._expire_tracks(now)

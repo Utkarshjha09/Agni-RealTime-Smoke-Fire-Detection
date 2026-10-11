@@ -53,7 +53,7 @@ REMOTE_USER="${TARGET%%@*}"
 REMOTE_HOST="${TARGET#*@}"
 [ -n "$REMOTE_DIR" ] || REMOTE_DIR="/home/$REMOTE_USER/agni"
 
-SERVICE_FILES="rover_server.py fire_detector.py range_sensor.py verify_rover.py requirements.txt rover.env.example agni-rover.service README.md"
+SERVICE_FILES="rover_server.py security.py fire_detector.py range_sensor.py verify_rover.py requirements.txt rover.env.example agni-rover.service README.md"
 for name in $SERVICE_FILES; do
   [ -f "$HERE/$name" ] || die "missing $name next to this script"
   # An empty source file once reached the Pi this way, and the rover then exited
@@ -88,7 +88,7 @@ REMOTE_SUMS="$($SSH "cd '$REMOTE_DIR' && md5sum $SERVICE_FILES")"
 [ "$LOCAL_SUMS" = "$REMOTE_SUMS" ] || die "the files on the Pi do not match this computer after copying:
 $(diff <(echo "$LOCAL_SUMS") <(echo "$REMOTE_SUMS") || true)
 Nothing was restarted. Run deploy.sh again."
-$SSH "cd '$REMOTE_DIR' && python3 -m py_compile rover_server.py fire_detector.py range_sensor.py" \
+$SSH "cd '$REMOTE_DIR' && python3 -m py_compile rover_server.py security.py fire_detector.py range_sensor.py" \
   || die "rover_server.py does not compile on the Pi; not restarting it."
 printf '   service files copied and verified\n'
 

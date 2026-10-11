@@ -17,6 +17,7 @@ be exercised before the hardware is wired up.
 """
 
 import asyncio
+import hmac
 import json
 import multiprocessing
 import os
@@ -32,6 +33,11 @@ from typing import Any
 import cv2
 import numpy as np
 from aiohttp import web
+
+from security import (
+    PROTOCOL, FailureLimiter, Session, TicketBook, auth_proof, finite, is_hex_nonce,
+    new_nonce, server_proof, session_key, strict_loads,
+)
 
 try:
     from picamera2 import Picamera2
@@ -122,6 +128,18 @@ def clamp(value: float, low: float = -1.0, high: float = 1.0) -> float:
     return max(low, min(high, value))
 
 
+# Seconds a new connection has to answer the challenge before it is dropped.
+AUTH_TIMEOUT = 5.0
+# A client that cannot take a message in this long is dropped rather than allowed
+# to stall telemetry, detections and the watchdog for everyone else.
+SEND_TIMEOUT = 1.0
+# The device driving keeps the controls while its commands keep coming. After this
+# long without one, another device may take over. BRAKE works from any device.
+DRIVER_LEASE = 3.0
+# Control messages are a few hundred bytes. Anything far larger is not the app.
+MAX_MESSAGE_BYTES = 16 * 1024
+
+
 # --------------------------------------------------------------------------
 # Authentication
 # --------------------------------------------------------------------------
@@ -133,14 +151,30 @@ def request_token(request: web.Request) -> str:
     return request.query.get("token", "")
 
 
-def authorized(request: web.Request) -> bool:
+def token_matches(request: web.Request) -> bool:
+    """The raw token, for tools like curl and verify_rover.py. The app never sends it."""
     if not ROVER_TOKEN:
         return True
     # compare_digest keeps the check constant-time.
     return secrets.compare_digest(request_token(request), ROVER_TOKEN)
 
 
-def unauthorized() -> web.Response:
+def check_http(request: web.Request, purpose: str | None = None) -> web.Response | None:
+    """None when the request may proceed, otherwise the response refusing it.
+
+    The app opens video with a ticket it got over its authenticated socket; the token
+    itself is accepted too, for tools, but it travels in clear when used that way.
+    """
+    state: RoverState = request.app["state"]
+    address = request.remote or "unknown"
+    if state.limiter.blocked(address):
+        return web.json_response({"error": "too many failed attempts; try again in a minute"}, status=429)
+    ticket = request.query.get("ticket", "")
+    if purpose and ticket and state.tickets.redeem(ticket, purpose):
+        return None
+    if token_matches(request):
+        return None
+    state.limiter.fail(address)
     return web.json_response({"error": "unauthorized"}, status=401)
 
 
@@ -372,6 +406,102 @@ class Camera:
 
 
 # --------------------------------------------------------------------------
+# One camera, one encoder, every viewer
+# --------------------------------------------------------------------------
+
+# BGR, the same colours as the app and model/live_test.py: fire orange, smoke grey-blue.
+BOX_COLOURS = {"fire": (40, 120, 255), "smoke": (200, 170, 140)}
+
+
+def draw_detections(frame: Any, boxes: list[dict[str, Any]]) -> Any:
+    """The frame with the live fire and smoke boxes drawn on it, as live_test.py draws them.
+
+    Drawn on the picture rather than over it, so a box can never drift from the
+    frame it belongs to, however the phone lays the video out.
+    """
+    frame = frame.copy()
+    height, width = frame.shape[:2]
+    scale = max(0.5, width / 1280)
+    thickness = max(2, round(2 * scale))
+    for item in boxes:
+        box = item["boundingBox"]
+        x1, y1 = int(box["left"] / 100 * width), int(box["top"] / 100 * height)
+        x2, y2 = int((box["left"] + box["width"]) / 100 * width), int((box["top"] + box["height"]) / 100 * height)
+        colour = BOX_COLOURS.get(item["kind"], (255, 255, 255))
+        cv2.rectangle(frame, (x1, y1), (x2, y2), colour, thickness)
+        label = f"{item['kind'].upper()} {item['confidence']:.0f}%"
+        (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7 * scale, thickness)
+        top = max(y1, text_height + 12)
+        cv2.rectangle(frame, (x1, top - text_height - 10), (x1 + text_width + 10, top), colour, -1)
+        cv2.putText(frame, label, (x1 + 5, top - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.7 * scale, (16, 16, 16), thickness, cv2.LINE_AA)
+    return frame
+
+
+def encode_variants(frame: Any, boxes: list[dict[str, Any]], wanted: set[str]) -> dict[str, bytes]:
+    """JPEG once per variant someone is watching, never once per viewer."""
+    out: dict[str, bytes] = {}
+    for variant in wanted:
+        image = draw_detections(frame, boxes) if variant == "overlay" else frame
+        ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if ok:
+            out[variant] = encoded.tobytes()
+    return out
+
+
+class FrameHub:
+    """Captures the camera at STREAM_FPS and hands the same frame to everyone.
+
+    Each stream used to grab and encode its own frames on a timer, so two viewers
+    cost two encodes and a frame could wait most of an interval before being sent.
+    Now one loop captures, the detector takes the latest raw frame from it, and every
+    stream is woken the moment a new JPEG exists: what model/live_test.py does on a
+    laptop, where the video has no lag.
+    """
+
+    def __init__(self, camera: "Camera") -> None:
+        self.camera = camera
+        self.raw: Any = None
+        self.raw_at = 0.0
+        self.seq = 0
+        self.jpeg: dict[str, bytes | None] = {"raw": None, "overlay": None}
+        self.viewers: dict[str, int] = {"raw": 0, "overlay": 0}
+        self.error = ""
+        self.changed = asyncio.Condition()
+
+    def frame_age(self) -> float:
+        """Seconds since the camera last delivered, or infinity before the first frame."""
+        return time.monotonic() - self.raw_at if self.raw_at else float("inf")
+
+    async def run(self, state: "RoverState") -> None:
+        loop = asyncio.get_running_loop()
+        interval = 1.0 / STREAM_FPS
+        while True:
+            started = time.monotonic()
+            try:
+                raw = await loop.run_in_executor(None, self.camera.raw_frame)
+                wanted = {variant for variant, count in self.viewers.items() if count > 0}
+                encoded = await loop.run_in_executor(None, encode_variants, raw, state.overlay_boxes(), wanted)
+                async with self.changed:
+                    self.raw, self.raw_at, self.seq = raw, time.monotonic(), self.seq + 1
+                    for variant in self.jpeg:
+                        self.jpeg[variant] = encoded.get(variant)
+                    self.changed.notify_all()
+                self.error = ""
+            except Exception as error:  # noqa: BLE001 - a camera error must not take the server down
+                self.error = f"{type(error).__name__}: {error}"
+                await asyncio.sleep(0.5)
+            await asyncio.sleep(max(0.0, interval - (time.monotonic() - started)))
+
+    async def next_frame(self, variant: str, after: int, timeout: float) -> tuple[int, bytes]:
+        """The first frame newer than `after` in this variant. TimeoutError if none comes."""
+        async with self.changed:
+            await asyncio.wait_for(
+                self.changed.wait_for(lambda: self.seq > after and self.jpeg[variant] is not None), timeout,
+            )
+            return self.seq, self.jpeg[variant]  # type: ignore[return-value]
+
+
+# --------------------------------------------------------------------------
 # Shared state
 # --------------------------------------------------------------------------
 
@@ -379,7 +509,12 @@ class Camera:
 class RoverState:
     motors: MotorDriver
     camera: Camera
-    clients: set[web.WebSocketResponse]
+    # Each connected app and its session; None only when the rover runs with no token.
+    clients: dict[web.WebSocketResponse, Session | None]
+    hub: Any = None
+    # The boxes from the detector's latest pass, drawn onto the overlay stream.
+    overlay: list = field(default_factory=list)
+    overlay_at: float = 0.0
     last_command: float = 0.0
     left_power: float = 0.0
     right_power: float = 0.0
@@ -396,6 +531,12 @@ class RoverState:
     range_sensor: Any = None
     range_error: str = ""
     last_range: Any = None
+    tickets: TicketBook = field(default_factory=TicketBook)
+    limiter: FailureLimiter = field(default_factory=FailureLimiter)
+    driver: Any = None
+    driver_seen: float = 0.0
+    denied: set = field(default_factory=set)
+    tasks: set = field(default_factory=set)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def __post_init__(self) -> None:
@@ -406,18 +547,54 @@ class RoverState:
             "cameraQuality": "720p", "whiteBalance": CAMERA_AWB,
         }
 
+    def overlay_boxes(self) -> list[dict[str, Any]]:
+        """Boxes still being seen. They expire like the app's do: a few passes unseen."""
+        window = max(3.0, 4 * self.inference_ms / 1000)
+        return self.overlay if time.monotonic() - self.overlay_at <= window else []
+
+    def spawn(self, coroutine: Any) -> None:
+        """Run something in the background, kept referenced until it finishes."""
+        task = asyncio.create_task(coroutine)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+
+    async def send_to(self, ws: web.WebSocketResponse, payload: dict[str, Any]) -> bool:
+        """Send one message, signed for that client's session. False if it failed."""
+        if ws.closed or ws not in self.clients:
+            return False
+        session = self.clients[ws]
+        message = session.seal(payload) if session else payload
+        try:
+            await asyncio.wait_for(ws.send_json(message), SEND_TIMEOUT)
+            return True
+        except (ConnectionResetError, RuntimeError, asyncio.TimeoutError):
+            return False
+
     async def broadcast(self, payload: dict[str, Any]) -> None:
-        dead: list[web.WebSocketResponse] = []
-        for client in list(self.clients):
-            if client.closed:
-                dead.append(client)
-                continue
-            try:
-                await client.send_json(payload)
-            except (ConnectionResetError, RuntimeError):
-                dead.append(client)
-        for client in dead:
-            self.clients.discard(client)
+        """Send to every client at once, each with its own timeout.
+
+        One after another, a single phone on a weak link could hold up telemetry
+        and detections for every other client behind it.
+        """
+        clients = list(self.clients)
+        if not clients:
+            return
+        results = await asyncio.gather(*(self.send_to(ws, payload) for ws in clients))
+        for ws, delivered in zip(clients, results):
+            if not delivered:
+                self.clients.pop(ws, None)
+                if not ws.closed:
+                    self.spawn(ws.close())
+
+    def claim_driver(self, ws: web.WebSocketResponse) -> bool:
+        """True when this client may drive: it holds the controls, or nobody does."""
+        now = time.monotonic()
+        holder = self.driver
+        if holder is not None and holder is not ws and not holder.closed and now - self.driver_seen < DRIVER_LEASE:
+            return False
+        self.driver = ws
+        self.driver_seen = now
+        return True
 
     async def push_telemetry(self) -> None:
         """Send telemetry now, so the app sees a device change without waiting."""
@@ -523,6 +700,9 @@ def telemetry_payload(state: RoverState) -> dict[str, Any]:
         "motorOutput": state.motors.enabled,
         "cameraSource": state.camera.source,
         "cameraHfovDeg": CAMERA_HFOV_DEG,
+        # How fresh the video is. The app shows a stalled camera from this rather
+        # than leaving the last picture on screen looking live.
+        "cameraFrameAgeMs": round(min(state.hub.frame_age(), 3600.0) * 1000) if state.hub else VALUE_UNAVAILABLE,
         # The app offers white balance only for a camera that can take it.
         "whiteBalanceAvailable": state.camera.white_balance_available,
         # Available means a pin is wired. The on/off state is the rover's, not
@@ -548,10 +728,14 @@ async def publish_detection(state: RoverState, data: dict[str, Any]) -> dict[str
         raise ValueError("kind must be fire or smoke")
 
     box = data.get("boundingBox")
-    if box and not all(key in box for key in ("left", "top", "width", "height")):
-        raise ValueError("boundingBox needs left, top, width and height percentages")
+    if box is not None:
+        if not isinstance(box, dict) or not all(key in box for key in ("left", "top", "width", "height")):
+            raise ValueError("boundingBox needs left, top, width and height percentages")
+        # Percentages of the frame. A NaN or a huge value would reach the app and
+        # draw nonsense, or nothing, over the live video.
+        box = {key: round(max(0.0, min(100.0, finite(box[key]))), 2) for key in ("left", "top", "width", "height")}
 
-    confidence = round(float(data.get("confidence", 0)), 1)
+    confidence = round(max(0.0, min(100.0, finite(data.get("confidence", 0)))), 1)
     # Higher sensitivity permits lower-confidence model results.
     minimum = 85 - float(state.settings["detectionSensitivity"]) * 0.6
     if confidence < minimum:
@@ -559,12 +743,12 @@ async def publish_detection(state: RoverState, data: dict[str, Any]) -> dict[str
         return {"ok": True, "ignored": "below sensitivity threshold", "threshold": round(minimum, 1)}
 
     detection = {
-        "id": data.get("id", str(uuid.uuid4())),
+        "id": str(data.get("id") or uuid.uuid4())[:64],
         "kind": data["kind"],
         "confidence": confidence,
         "timestamp": time.strftime("%H:%M:%S"),
         "epoch": time.time(),
-        "location": data.get("location", "Camera view"),
+        "location": str(data.get("location") or "Camera view")[:80],
         "snapshotUrl": data.get("snapshotUrl", ""),
         "boundingBox": box,
         "confirmedBySensor": bool(data.get("confirmedBySensor", False)),
@@ -577,12 +761,13 @@ async def publish_detection(state: RoverState, data: dict[str, Any]) -> dict[str
 
 async def detection_handler(request: web.Request) -> web.Response:
     """Accept a fire/smoke result from an external inference process."""
-    if not authorized(request):
-        return unauthorized()
+    refused = check_http(request)
+    if refused:
+        return refused
     state: RoverState = request.app["state"]
     try:
-        data = await request.json()
-    except json.JSONDecodeError:
+        data = strict_loads(await request.text())
+    except ValueError:
         return web.json_response({"error": "body must be JSON"}, status=400)
     if not isinstance(data, dict):
         return web.json_response({"error": "body must be a JSON object"}, status=400)
@@ -601,60 +786,77 @@ async def detection_handler(request: web.Request) -> web.Response:
 # --------------------------------------------------------------------------
 
 async def frame_handler(request: web.Request) -> web.Response:
-    if not authorized(request):
-        return unauthorized()
+    refused = check_http(request, "frame")
+    if refused:
+        return refused
     state: RoverState = request.app["state"]
-    try:
-        body = await asyncio.get_running_loop().run_in_executor(None, state.camera.frame)
-        return web.Response(body=body, content_type="image/jpeg", headers={"Cache-Control": "no-store"})
-    except Exception as error:  # noqa: BLE001 - report to the app instead of a 500 page
-        return web.json_response({"error": str(error)}, status=503)
+    hub: FrameHub = state.hub
+    if hub.raw is None or hub.frame_age() > STREAM_FRAME_TIMEOUT:
+        return web.json_response({"error": hub.error or "the camera has not delivered a frame"}, status=503)
+    overlay = request.query.get("overlay") == "1"
+    encoded = await asyncio.get_running_loop().run_in_executor(
+        None, encode_variants, hub.raw, state.overlay_boxes(), {"overlay" if overlay else "raw"},
+    )
+    body = encoded.get("overlay" if overlay else "raw")
+    if body is None:
+        return web.json_response({"error": "Unable to encode camera frame"}, status=503)
+    return web.Response(body=body, content_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
 
 async def stream_handler(request: web.Request) -> web.StreamResponse:
     """Continuous MJPEG video, the way a browser shows a webcam.
 
-    Polling /frame.jpg makes the phone swap one picture for the next several times
-    a second, and Android blanks an image while it swaps, so the feed blinked. A
-    stream is one long response the app draws frame by frame, with no swap.
+    `?overlay=1` gives the video with the fire and smoke boxes drawn on it, as
+    model/live_test.py shows it; without it, the plain camera. Each new frame is sent
+    the moment the hub has it.
     """
-    if not authorized(request):
-        return unauthorized()
+    refused = check_http(request, "stream")
+    if refused:
+        return refused
     state: RoverState = request.app["state"]
+    hub: FrameHub = state.hub
+    variant = "overlay" if request.query.get("overlay") == "1" else "raw"
     response = web.StreamResponse(headers={
         "Content-Type": "multipart/x-mixed-replace; boundary=frame",
         "Cache-Control": "no-store",
-        # The app reads this from a local WebView page, which has no origin of
-        # its own. Without this header the page may not read the body. The
-        # token above still gates every request.
+        # The app shows this from a local WebView page, which has no origin of its
+        # own. A ticket or the token above still gates every request.
         "Access-Control-Allow-Origin": "*",
     })
     await response.prepare(request)
-    loop = asyncio.get_running_loop()
-    interval = 1.0 / STREAM_FPS
+    hub.viewers[variant] += 1
+    seq = 0
     try:
         while True:
-            started = time.monotonic()
             try:
-                jpeg = await asyncio.wait_for(loop.run_in_executor(None, state.camera.frame), STREAM_FRAME_TIMEOUT)
-            except Exception as error:  # noqa: BLE001 - end this stream, never the server
-                print(f"Stream ended: {type(error).__name__}: {error}")
+                seq, jpeg = await hub.next_frame(variant, seq, STREAM_FRAME_TIMEOUT)
+            except asyncio.TimeoutError:
+                # The camera stopped delivering. Ending the stream lets the app say
+                # so, instead of holding a frozen frame on screen.
+                print(f"Stream ended: no camera frame for {STREAM_FRAME_TIMEOUT:.0f} s ({hub.error or 'no error reported'})")
                 break
             await response.write(
                 b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
                 + str(len(jpeg)).encode() + b"\r\n\r\n" + jpeg + b"\r\n"
             )
-            await asyncio.sleep(max(0.0, interval - (time.monotonic() - started)))
     except ConnectionResetError:
-        # The viewer went away. Nothing to clean up: each stream owns no state.
-        pass
+        pass  # The viewer went away.
+    finally:
+        hub.viewers[variant] -= 1
     return response
 
 
 async def status_handler(request: web.Request) -> web.Response:
-    """Unauthenticated liveness probe. Reports no camera content and no control."""
+    """Liveness probe. Without the token it says only that the rover is up.
+
+    The details (motor state, wheel power, settings) are for tools holding the token;
+    anyone else on the network learns nothing they could use.
+    """
     state: RoverState = request.app["state"]
+    if ROVER_TOKEN and not token_matches(request):
+        return web.json_response({"ok": True, "roverName": ROVER_NAME, "authRequired": True, "protocol": PROTOCOL})
     return web.json_response({
+        "protocol": PROTOCOL,
         "ok": True,
         "roverName": ROVER_NAME,
         "authRequired": bool(ROVER_TOKEN),
@@ -668,26 +870,74 @@ async def status_handler(request: web.Request) -> web.Response:
     })
 
 
-async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
-    if not authorized(request):
-        return unauthorized()
+async def authenticate(ws: web.WebSocketResponse, state: "RoverState", address: str) -> Session | None:
+    """Challenge-response: the app proves it holds the token without sending it.
 
+    See security.py. A wrong answer, no answer within AUTH_TIMEOUT, or anything
+    that is not an answer counts as a failure towards the address's lockout.
+    """
+    nonce = new_nonce()
+    await ws.send_json({"type": "challenge", "nonce": nonce, "protocol": PROTOCOL})
+    try:
+        message = await ws.receive(timeout=AUTH_TIMEOUT)
+        reply = strict_loads(message.data) if message.type == web.WSMsgType.TEXT else None
+    except (asyncio.TimeoutError, ValueError, TypeError):
+        reply = None
+    if not (isinstance(reply, dict) and reply.get("type") == "auth" and is_hex_nonce(reply.get("clientNonce"))
+            and isinstance(reply.get("mac"), str)):
+        state.limiter.fail(address)
+        # Said out loud: an app from before the challenge existed fails exactly
+        # here, silently, and the log was the only place to find out why.
+        print(f"Refused a control connection from {address}: no answer to the challenge "
+              "(an app older than this rover, or not the app at all)")
+        return None
+    if not hmac.compare_digest(reply["mac"], auth_proof(ROVER_TOKEN, nonce, reply["clientNonce"])):
+        state.limiter.fail(address)
+        print(f"Refused a control connection from {address}: wrong token")
+        return None
+    state.limiter.succeed(address)
+    key = session_key(ROVER_TOKEN, nonce, reply["clientNonce"])
+    # The rover proves itself too, so the app can tell it is not talking to an
+    # impostor that took the rover's address on the network.
+    await ws.send_json({"type": "authOk", "proof": server_proof(key)})
+    return Session(key)
+
+
+async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
     state: RoverState = request.app["state"]
-    ws = web.WebSocketResponse(heartbeat=10)
+    address = request.remote or "unknown"
+    if state.limiter.blocked(address):
+        return web.json_response({"error": "too many failed attempts; try again in a minute"}, status=429)
+
+    ws = web.WebSocketResponse(heartbeat=10, max_msg_size=MAX_MESSAGE_BYTES)
     await ws.prepare(request)
-    state.clients.add(ws)
+    if ROVER_TOKEN:
+        session = await authenticate(ws, state, address)
+        if session is None:
+            await ws.close(code=4401, message=b"authentication failed")
+            return ws
+    else:
+        # Open mode, for a bench with no token: say so, so an app that holds a
+        # token can refuse to talk to a rover that is not asking for it.
+        session = None
+        await ws.send_json({"type": "hello", "auth": "none", "protocol": PROTOCOL})
+
+    state.clients[ws] = session
     # finally, because a send failing mid-session must still deregister this
     # client and, if it was the last one, cut the motors.
     try:
-        await ws.send_json(telemetry_payload(state))
-        await ws.send_json({"type": "settings", "settings": state.settings})
+        await state.send_to(ws, telemetry_payload(state))
+        await state.send_to(ws, {"type": "settings", "settings": state.settings})
 
         async for message in ws:
             if message.type != web.WSMsgType.TEXT:
                 continue
             try:
-                command = json.loads(message.data)
-            except json.JSONDecodeError:
+                received = strict_loads(message.data)
+                command = session.open(received) if session else received
+            except (ValueError, TypeError):
+                # Forged, replayed or malformed. Dropping the packet rather than the
+                # connection means an injected packet cannot cut a real driver off.
                 continue
             if not isinstance(command, dict):
                 continue
@@ -695,22 +945,39 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
             kind = command.get("type")
             try:
                 if kind == "drive":
-                    throttle = clamp(float(command.get("throttle", 0)))
-                    steering = clamp(float(command.get("steering", 0)))
+                    throttle = clamp(finite(command.get("throttle", 0)))
+                    steering = clamp(finite(command.get("steering", 0)))
+                    if not state.claim_driver(ws):
+                        # Another device holds the controls. Tell this one once.
+                        if ws not in state.denied:
+                            state.denied.add(ws)
+                            await state.send_to(ws, {"type": "control", "driving": False, "reason": "Another device is driving"})
+                        continue
+                    if ws in state.denied:
+                        state.denied.discard(ws)
+                        await state.send_to(ws, {"type": "control", "driving": True})
                     if state.brake_until and throttle == 0 and steering == 0:
                         # Letting go of the stick just after BRAKE sends a zero
                         # command; that must not cut the brake short.
                         continue
                     # Driving again takes over from a brake at once.
                     state.brake_until = 0.0
-                    state.left_power, state.right_power = state.motors.drive(throttle, steering, bool(command.get("sprint", False)))
+                    state.left_power, state.right_power = state.motors.drive(throttle, steering, command.get("sprint") is True)
                     state.last_command = time.monotonic()
                 elif kind == "brake":
+                    # From any device, driver or not: stopping is never locked out.
                     await state.brake()
+                elif kind == "ticket":
+                    purpose = command.get("purpose")
+                    if purpose in ("stream", "frame"):
+                        # A stream ticket opens one stream; a frame ticket covers
+                        # polling for its lifetime.
+                        ticket = state.tickets.issue(purpose, reusable=purpose == "frame")
+                        await state.send_to(ws, {"type": "ticket", "purpose": purpose, "ticket": ticket, "ttl": state.tickets.ttl})
                 elif kind == "device":
                     device = command.get("device")
                     if device in ("flash", "siren"):
-                        if state.motors.set_device(device, bool(command.get("enabled", False))) and device == "siren":
+                        if state.motors.set_device(device, command.get("enabled") is True) and device == "siren":
                             # A manual siren toggle wins over an auto-siren hold.
                             state.siren_until = 0.0
                         # Always answer, so a toggle for an unwired device snaps
@@ -720,7 +987,7 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
                     incoming = command.get("settings", {})
                     if isinstance(incoming, dict):
                         sensitivity = incoming.get("detectionSensitivity", state.settings["detectionSensitivity"])
-                        state.settings["detectionSensitivity"] = max(0, min(100, int(sensitivity)))
+                        state.settings["detectionSensitivity"] = max(0, min(100, int(finite(sensitivity))))
                         state.settings["autoSiren"] = bool(incoming.get("autoSiren", state.settings["autoSiren"]))
                         state.settings["showLocation"] = bool(incoming.get("showLocation", state.settings["showLocation"]))
                         quality = incoming.get("cameraQuality", state.settings["cameraQuality"])
@@ -730,12 +997,17 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
                         balance = incoming.get("whiteBalance")
                         if balance in WHITE_BALANCE_MODES and state.camera.set_white_balance(balance):
                             state.settings["whiteBalance"] = balance
-                    await ws.send_json({"type": "settings", "settings": state.settings})
+                    await state.send_to(ws, {"type": "settings", "settings": state.settings})
             except (TypeError, ValueError):
                 # One malformed packet must not end a driving session.
                 continue
     finally:
-        state.clients.discard(ws)
+        state.clients.pop(ws, None)
+        state.denied.discard(ws)
+        if state.driver is ws:
+            # The driver left: stop rather than carry on with its last command.
+            state.driver = None
+            await state.stop()
         # Only stop the motors when the last operator disconnects.
         if not state.clients:
             await state.stop()
@@ -758,7 +1030,9 @@ async def watchdog(state: RoverState) -> None:
             if state.siren_until and now > state.siren_until:
                 state.siren_until = 0.0
                 state.motors.set_device("siren", False)
-                await state.push_telemetry()
+                # In the background: the watchdog's own loop must never wait on a
+                # client's network, or a stalled phone could delay a motor stop.
+                state.spawn(state.push_telemetry())
         except Exception as error:  # noqa: BLE001 - the watchdog must outlive any one failure
             print(f"Watchdog error: {type(error).__name__}: {error}")
         await asyncio.sleep(0.05)
@@ -827,15 +1101,26 @@ async def detector_loop(state: RoverState) -> None:
         while True:
             started = time.monotonic()
             try:
-                frame = await loop.run_in_executor(None, lambda: frame_for_detector(state.camera.raw_frame()))
+                # The hub's latest frame: the camera is read once for video and model alike.
+                hub: FrameHub = state.hub
+                source = hub.raw if hub.raw is not None and hub.frame_age() < 1.0 else None
+                frame = await loop.run_in_executor(
+                    None, lambda: frame_for_detector(source if source is not None else state.camera.raw_frame()),
+                )
                 detections, inference_ms = await loop.run_in_executor(pool, worker_detect, frame)
                 state.inference_ms = inference_ms
                 state.detector_error = ""
+                shown = []
                 for detection in detections:
                     # No snapshotUrl: the rover cannot know which address the phone
                     # reaches it on, and a 127.0.0.1 link would be dead on the phone.
                     # The app shows a kind icon instead of a broken thumbnail.
-                    await publish_detection(state, detection)
+                    result = await publish_detection(state, detection)
+                    # Only boxes that passed the sensitivity gate are drawn, so the
+                    # video shows exactly what the alerts show.
+                    if "detection" in result:
+                        shown.append(result["detection"])
+                state.overlay, state.overlay_at = shown, time.monotonic()
             except BrokenProcessPool:
                 # The detector process died (out of memory, a native crash). The
                 # rover keeps driving; bring the model back in a fresh process.
@@ -897,6 +1182,7 @@ async def range_loop(state: RoverState) -> None:
 
 async def start_background_tasks(app: web.Application) -> None:
     state: RoverState = app["state"]
+    app["hub"] = asyncio.create_task(state.hub.run(state))
     app["watchdog"] = asyncio.create_task(watchdog(state))
     app["telemetry"] = asyncio.create_task(telemetry_loop(state))
     if DETECTOR_ENABLED:
@@ -906,7 +1192,7 @@ async def start_background_tasks(app: web.Application) -> None:
 
 
 async def stop_background_tasks(app: web.Application) -> None:
-    for key in ("watchdog", "telemetry", "detector", "range"):
+    for key in ("hub", "watchdog", "telemetry", "detector", "range"):
         task = app.get(key)
         if task:
             task.cancel()
@@ -917,7 +1203,9 @@ async def stop_background_tasks(app: web.Application) -> None:
 
 def make_app() -> web.Application:
     app = web.Application()
-    app["state"] = RoverState(MotorDriver(), Camera(), set())
+    state = RoverState(MotorDriver(), Camera(), {})
+    state.hub = FrameHub(state.camera)
+    app["state"] = state
     app.router.add_get("/frame.jpg", frame_handler)
     app.router.add_get("/stream.mjpg", stream_handler)
     app.router.add_get("/status", status_handler)

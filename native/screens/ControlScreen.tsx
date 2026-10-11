@@ -310,7 +310,6 @@ function AlertBanner({ alert, now, showLocation, onDismiss, onMap }: { alert: De
 }
 
 export default function ControlScreen({ landscape = false, onNavigate }: { landscape?: boolean; onNavigate: (tab: AppTab) => void }) {
-  const [ar, setAr] = useState(true);
   const [sprint, setSprint] = useState(false);
   const [accelerating, setAccelerating] = useState(false);
   const [dismissedId, setDismissedId] = useState<string | null>(null);
@@ -323,7 +322,7 @@ export default function ControlScreen({ landscape = false, onNavigate }: { lands
   const insets = useScreenInsets(landscape);
   const {
     activeDetection, brake, cameraUrl, connectionState, detections, drive, streamUrl, streamAttempt,
-    cameraState, onCameraLoad, onCameraError, onStreamError, setDeviceAction, settings, telemetry,
+    cameraState, controlNotice, onCameraLoad, onCameraError, onStreamError, overlay, setDeviceAction, setOverlay, settings, telemetry,
   } = useRobot();
 
   const connected = connectionState === "connected";
@@ -466,7 +465,9 @@ export default function ControlScreen({ landscape = false, onNavigate }: { lands
         onOpenSettings={openSettings}
       />
 
-      {ar && liveBoxes.map(detection => (
+      {/* The rover draws boxes onto its own video, so they only come from here for
+          a camera that is not the rover's. */}
+      {overlay && !streamUrl && liveBoxes.map(detection => (
         <DetectionBox key={detection.id} kind={detection.kind} confidence={detection.confidence} rect={boxOnScreen(detection.boundingBox!, frameSize, viewSize)} />
       ))}
 
@@ -479,6 +480,13 @@ export default function ControlScreen({ landscape = false, onNavigate }: { lands
         </View>
 
         <View style={styles.utilRow} pointerEvents="box-none">
+          {connected && controlNotice && (
+            // The rover gives the controls to one device at a time. Without this the
+            // stick would look broken here while someone else drives. BRAKE still works.
+            <Glass radius={999} style={styles.motorsOff} borderColor="rgba(255,107,53,0.55)">
+              <Text style={styles.motorsOffText}>{controlNotice.toUpperCase()}</Text>
+            </Glass>
+          )}
           {connected && !telemetry.motorOutput && (
             // Without this the stick looks broken: commands arrive, the wheels stay still.
             <Glass radius={999} style={styles.motorsOff} borderColor="rgba(255,107,53,0.55)">
@@ -498,7 +506,7 @@ export default function ControlScreen({ landscape = false, onNavigate }: { lands
           {telemetry.sirenAvailable && (
             <IconToggle Icon={SirenIcon} label={siren ? "Silence rover siren" : "Sound rover siren"} active={siren} disabled={!connected} onPress={onSirenPress} />
           )}
-          <IconToggle Icon={ArIcon} label={ar ? "Hide detection overlay" : "Show detection overlay"} active={ar} onPress={() => setAr(value => !value)} />
+          <IconToggle Icon={ArIcon} label={overlay ? "Hide detection boxes" : "Show detection boxes"} active={overlay} onPress={() => setOverlay(!overlay)} />
         </View>
 
         {alert && (

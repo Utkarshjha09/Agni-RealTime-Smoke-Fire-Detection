@@ -19,8 +19,63 @@ model/          Offline only  dataset, training, export, and a webcam test for t
 
 ---
 
+## See the model detect fire
+
+[![The fire model drawing a FIRE 68% box around a lighter flame, live on a webcam. Click to play the 38 second video.](docs/media/model-live-test.jpg)](docs/media/model-live-test.mp4)
+
+*Click the picture to play the video (38 seconds, 1920×1020, 41 MB).*
+
+**What it shows.** The fire and smoke model watching a laptop webcam, live, through
+`model/live_test.py` in a browser. It is the same model the rover runs
+(`best_nano_111`, YOLO11n exported to NCNN at 640 px), with the same confidence floor
+(25 %). Recorded on 2026-10-11.
+
+1. **An ordinary room.** The status line under the picture reads *nothing detected*.
+   That is the correct answer, and the one the model gives most of the time.
+2. **A lighter is lit in front of the camera.** An orange **FIRE** box appears around
+   the flame with the model's confidence, 68 % in the picture above, and the status line
+   switches to *1 detection(s)* with the time the pass took.
+3. **The flame moves.** The box follows it from frame to frame.
+4. **The flame goes out.** The box disappears and the status returns to *nothing
+   detected*.
+
+**How the model finds the fire**, on every frame:
+
+| Step | What happens |
+|---|---|
+| Resize | the frame is scaled into a 640 × 640 square, padded rather than stretched, so a flame keeps its shape |
+| Look | YOLO11n looks at the whole image in one pass and proposes boxes, each with a class (**Fire** or **Smoke**) and a confidence from 0 to 100 % |
+| Filter | proposals below 25 % confidence are dropped |
+| Merge | overlapping boxes for the same flame are merged into the strongest one (non-maximum suppression, overlap 0.45) |
+| Draw | each remaining box is drawn with its class and confidence: orange for fire, grey-blue for smoke |
+
+On the rover the same steps run on the Pi camera, plus three more: a second confidence
+gate set by the app's sensitivity slider, tracking so one fire stays one alert, and
+drawing the boxes onto the video the app shows. See [The detection model](#the-detection-model).
+
+**What this video does not show.** Smoke (there is none in it), the Pi camera (this is
+a laptop webcam, where one pass takes far less time than on a Pi 4), or performance at a
+distance or in daylight. A lighter at arm's length is the easy case; treat the video as
+proof that the model works, not as a measure of how well.
+
+**Run it yourself**, with any flame or a fire video on another screen:
+
+```bash
+cd model
+python live_test.py            # then open http://127.0.0.1:8777
+```
+
+> **Playing it on GitHub.** The picture links to the video file in the repo, which
+> GitHub offers to view or download. For a player inside the README itself, edit this
+> file on github.com and drag `docs/media/model-live-test.mp4` into the editor: GitHub
+> uploads it and inserts a link that plays in place. Both files are stored with Git LFS,
+> as `.gitattributes` sets for `.mp4` and `.jpg`.
+
+---
+
 ## Table of contents
 
+- [See the model detect fire](#see-the-model-detect-fire)
 - [What it does, end to end](#what-it-does-end-to-end)
 - [Architecture](#architecture)
 - [Measured performance](#measured-performance)
@@ -36,8 +91,10 @@ model/          Offline only  dataset, training, export, and a webcam test for t
 - [Configuration reference](#configuration-reference)
 - [Design rules](#design-rules)
 - [Safety](#safety)
+- [Security](#security)
 - [Development and verification](#development-and-verification)
 - [Troubleshooting](#troubleshooting)
+- [Change log](#change-log)
 - [What to do next](#what-to-do-next)
 - [Credits and licences](#credits-and-licences)
 
@@ -47,16 +104,22 @@ model/          Offline only  dataset, training, export, and a webcam test for t
 
 This is the product. Every change to this repo is judged against it.
 
-1. **Connect.** The app reaches the rover over Wi-Fi. You type the Pi's address and a
-   token once; the app remembers them, reconnects on its own with exponential backoff,
-   and shows the real connection state on every screen.
+1. **Connect, securely.** The app reaches the rover over Wi-Fi. You type the Pi's
+   address and a token once; the app remembers them (the token in the phone's secure
+   keystore), reconnects on its own with exponential backoff, and shows the real
+   connection state on every screen. The token itself never crosses the network: the
+   app answers a challenge, and every command after that is signed. See
+   [Security](#security).
 2. **Live video.** The Pi streams continuous MJPEG video, about 14 frames per second at
-   720p on a Pi 4. The app paints each frame onto a canvas, so the picture never blanks
-   between frames, and it reports a stalled stream instead of freezing on the last
-   picture.
-3. **Detect.** A YOLO model on the rover finds fire and smoke. The app draws each box
-   over the live video exactly where the fire is, and shows a **Fire Detected** warning.
-   Boxes leave the screen a few seconds after the model stops seeing them.
+   720p on a Pi 4, captured and encoded once for every viewer. The app shows it with a
+   native `<img>`, the way a browser shows `model/live_test.py`, so it neither blinks nor
+   waits on script. A camera that stops delivering is reported as stopped, not left on
+   screen looking live.
+3. **Detect.** A YOLO model on the rover finds fire and smoke. The rover draws each box
+   **onto the video frame itself**, so a box can never drift from the fire it marks, and
+   the app shows a **Fire Detected** warning. Boxes leave the picture a few seconds after
+   the model stops seeing them. The AR button switches between the boxed and the plain
+   video.
 4. **Map.** The same detections appear in a 3D scene you can orbit. Each one is placed by
    **bearing** from real lens geometry, at a range that is either **measured** by the
    ultrasonic sensor or **estimated** from apparent size. The two are never blurred.
@@ -77,17 +140,17 @@ This is the product. Every change to this repo is judged against it.
 ```
                  ┌──────────────────────── Raspberry Pi ────────────────────────┐
                  │                                                               │
-  Pi Camera ────►│  rover_server.py  (one process: camera, HTTP, WebSocket,     │
-  HC-SR04  ─────►│                    motors, watchdog, telemetry)              │
-  L298N ◄────────│        │   ▲                                                 │
-                 │        │   │ frames in, boxes out                            │
-                 │        ▼   │                                                 │
+  Pi Camera ────►│  rover_server.py  (one process: frame hub, HTTP, WebSocket,  │
+  HC-SR04  ─────►│                    motors, watchdog, telemetry, security)    │
+  L298N ◄────────│        │   ▲     frame hub: capture once, draw boxes,        │
+                 │        │   │     encode once, push to every viewer           │
+                 │        ▼   │ frames in, boxes out                            │
                  │  detector process  (fire_detector.py, YOLO on NCNN,          │
                  │                     2 threads, lower CPU priority)           │
                  └───────┬──────────────────┬──────────────────┬────────────────┘
                          │                  │                  │
                GET /stream.mjpg     GET /frame.jpg     WebSocket /control
-               (live video, token)  (one frame)        (token, both directions)
+               (one-time ticket)    (ticket or token)  (challenge, then signed)
                          │                  │                  │
                          ▼                  ▼                  ▼
                  ┌──────────────────────────────────────────────────────┐
@@ -96,7 +159,7 @@ This is the product. Every change to this repo is judged against it.
                  └──────────────────────────────────────────────────────┘
 ```
 
-Three design decisions shape the whole system.
+Four design decisions shape the whole system.
 
 **The server owns the camera; the model runs in a process of its own.** Picamera2 cannot
 be opened by two processes, so `rover_server.py` holds the camera and hands frames to
@@ -106,10 +169,20 @@ the server, every 0.4 second pass froze the video, the telemetry and the drive
 commands with it. In its own process it can take as long as it likes and the server
 stays responsive.
 
-**Video is a stream, not a series of photos.** The app first fetched one JPEG at a time
-and swapped them, and Android blanks an image while it swaps, so the feed blinked. Now
-the Pi sends one long multipart MJPEG response and the app draws each frame over the
-last one.
+**Video is a stream, captured once and shown natively.** One loop on the Pi reads the
+camera, draws the detection boxes onto the frame, encodes it once, and pushes it to
+every viewer the moment it exists; the model takes its frames from the same loop. The
+app shows the stream with a plain `<img>`, decoded by the browser engine, exactly as
+`model/live_test.py` shows a laptop webcam. Earlier versions swapped single photos
+(Android blanked the picture on every swap) and then painted frames from script (extra
+work per frame on the phone).
+
+**The token never travels; every command is signed.** There is no TLS on a rover's local
+Wi-Fi, so the protocol assumes someone else on the network can read every packet. The
+app proves it holds the token by answering a random challenge, the rover proves the
+same back, and every message after that is numbered and signed with a key for that
+connection alone. Video opens with one-time tickets. A lost link can only ever stop
+the car.
 
 **The app is a thin, honest client.** It never invents data. Everything on screen came
 from the rover, or is explicitly marked as an estimate, or is marked unavailable.
@@ -123,16 +196,25 @@ Measured on a **Raspberry Pi 4 Model B (8 GB), Camera Module v2, Raspberry Pi OS
 
 | What | Result |
 |---|---|
-| Live video stream | **14.3 fps**, about 80 KB per 720p frame |
-| One frame from `/frame.jpg` | 130 to 170 ms |
+| Live video stream | **13.9 to 14.8 fps**, about 80 to 88 KB per 720p frame |
+| One frame from `/frame.jpg` | 130 to 200 ms |
 | Server response time (`/status`) while the model runs | **about 3 ms** |
-| Fire model, one pass at 640 px, 2 threads, stream running | **about 800 ms** (about 490 ms with no viewer) |
-| SD card used after a full install | 8.8 GB |
+| Fire model, one pass at 640 px, 2 threads set at load, stream running | **about 670 ms** |
+| Security and protocol checks (`verify_rover.py`, over Wi-Fi) | **22 of 22 pass** |
+| SD card used after a full install | 8.6 to 8.8 GB of 29 GB |
 | CPU temperature, model running, no heatsink | 67 to 74 °C |
 
-For comparison, before the model moved to its own process, the same Pi gave 1.9 fps
-video and took 340 ms to answer `/status`. With 3 model threads instead of 2 the model
-was no faster and the video slightly slower, which is why 2 is the default.
+How those numbers moved, on the same Pi:
+
+| Change | Before | After |
+|---|---|---|
+| Model moved to its own process | video 1.9 fps, `/status` 340 ms | video 14.3 fps, `/status` 3 ms |
+| Model threads limited to 2 (set after load) | 6,572 ms per pass | about 800 ms |
+| Threads set **before** load, so they take effect | about 870 ms, 61,000 log warnings in 10 min | about 670 ms, no warnings |
+| CPU-only PyTorch, no pip cache | 17.3 GB used | 8.8 GB used |
+
+With 3 model threads instead of 2 the model was no faster and the video slightly slower,
+which is why 2 is the default.
 
 These are numbers from one setup. Run `verify_rover.py` against your own rover to get
 yours.
@@ -157,6 +239,8 @@ yours.
 │   │
 │   ├── domain/                  Pure logic: no React, no network, testable on numbers
 │   │   ├── robot.ts             THE CONTRACT: every type that crosses the wire
+│   │   ├── crypto.ts            SHA-256, HMAC and the signed-message session;
+│   │   │                        the app's half of raspberry_pi/security.py
 │   │   ├── drive.ts             Tank-drive mix, identical to the Pi's
 │   │   ├── detectionView.ts     Box-to-screen mapping, live-box window, labels, times
 │   │   ├── geometry.ts          Frame position to bearing; range measured or estimated
@@ -167,24 +251,31 @@ yours.
 │   │   └── RobotContext.tsx     Session: connection, telemetry, detections, drive
 │   │                            commands, video stream state, map clearing
 │   ├── services/
-│   │   ├── robotGateway.ts      WebSocket lifecycle, backoff, message routing
-│   │   └── storage.ts           Remembers the rover and settings between launches
+│   │   ├── robotGateway.ts      WebSocket lifecycle, challenge-response, signed
+│   │   │                        messages, video tickets, backoff, message routing
+│   │   └── storage.ts           Remembers the rover and settings; token in the
+│   │                            Android Keystore / iOS Keychain
 │   │
 │   ├── components/
-│   │   ├── LiveStream.tsx       Reads /stream.mjpg and paints it; detects stalls
+│   │   ├── LiveStream.tsx       Shows /stream.mjpg in a native <img>, as a browser does
 │   │   ├── Joystick.tsx         Multi-touch stick on react-native-gesture-handler
 │   │   ├── useOrientation.ts    Landscape detection and safe-area screen padding
 │   │   └── Glass.tsx, icons.tsx, ui.tsx, anim.ts, AppGround.tsx
 │   └── theme.ts                 Colour, font and radius tokens
 │
 ├── raspberry_pi/                The rover service (Python, aiohttp)
-│   ├── rover_server.py          Camera, MJPEG stream, WebSocket, motors, brake,
-│   │                            watchdog, telemetry, detector process management
-│   ├── fire_detector.py         YOLO inference, box tracking, detector-process entry
+│   ├── rover_server.py          Camera and frame hub, MJPEG stream with drawn boxes,
+│   │                            WebSocket, motors, brake, driver lock, watchdog,
+│   │                            telemetry, detector process management
+│   ├── security.py              Challenge-response, signed messages, video tickets,
+│   │                            lockout, strict JSON (the rover's half of crypto.ts)
+│   ├── fire_detector.py         YOLO inference, thread limit, box tracking,
+│   │                            detector-process entry
 │   ├── range_sensor.py          HC-SR04 ultrasonic driver
 │   ├── deploy.sh                Deploy to a Pi over SSH, with byte-for-byte checks
-│   ├── verify_rover.py          Exercises every endpoint the app uses, and reports
-│   ├── agni-rover.service       systemd unit, so the rover starts at boot
+│   ├── verify_rover.py          Exercises every endpoint the app uses, attacks the
+│   │                            control link, and reports each result
+│   ├── agni-rover.service       systemd unit: starts at boot, sandboxed
 │   ├── rover.env.example        Every setting, commented; becomes rover.env on the Pi
 │   ├── requirements.txt
 │   └── README.md                Rover-only details: endpoints, tuning, sensors
@@ -198,6 +289,8 @@ yours.
 │   ├── train_colab.ipynb        The same run on a free Colab or Kaggle GPU
 │   ├── weights/                 Your weights and the NCNN export (not in git)
 │   └── README.md
+│
+├── docs/media/                  The model demo video and its preview picture (Git LFS)
 │
 ├── AGENTS.md                    Standing rules for anyone editing this repo
 └── README.md                    You are here
@@ -278,9 +371,13 @@ cd raspberry_pi
 python verify_rover.py --token devtoken --drive
 ```
 
-`verify_rover.py` walks the same path the app does: the token, a camera frame, the live
-stream, telemetry, the settings round trip, the flashlight if wired, a drive command
-and the safety watchdog. It exits non-zero if anything failed.
+`verify_rover.py` first checks the security code on known values, then walks the same
+path the app does: the token, a camera frame, the live stream, the challenge-response
+handshake, telemetry, the settings round trip, the flashlight if wired, and with
+`--drive` a drive command, the driver lock, brake from a second device and the safety
+watchdog. Along the way it attacks the link as someone else on the Wi-Fi could, with
+a wrong token, a replayed command, a forged one, an unsigned one and a reused video
+ticket, and checks each is refused. It exits non-zero if anything failed.
 
 **How you know it worked.** Every line says `PASS` or an explained `WARN`, and the
 `Live stream` line shows a frame rate.
@@ -292,7 +389,9 @@ cd model
 python live_test.py            # opens http://127.0.0.1:8777 in your browser
 ```
 
-Hold a phone playing a fire video in front of the webcam and boxes appear.
+Hold a phone playing a fire video in front of the webcam and boxes appear. The rover
+draws its boxes the same way, and the app shows the rover's stream the same way this
+page does, with a plain `<img>`.
 
 ---
 
@@ -477,7 +576,11 @@ What that does: the first line gives the service file to systemd, Linux's servic
 manager. The second makes systemd read it. The third (`enable`) starts the rover at
 every boot and (`--now`) starts it immediately. From then on the rover restarts itself
 three seconds after any crash, stops the motors when it is stopped, and logs to the
-system journal.
+system journal. The unit also **sandboxes** the rover: it cannot gain privileges (no
+`sudo` from inside it) and system folders are read-only to it.
+
+Run the same three lines again whenever `agni-rover.service` itself changes; a deploy
+copies the file but only you can install it.
 
 **How you know it worked.**
 
@@ -489,10 +592,14 @@ journalctl -u agni-rover -n 30 --no-pager
 The log should include:
 
 ```
+Camera tuning: imx219_noir.json                     (only if CAMERA_TUNING is set)
 Camera sensor mode: 1640x1232, full field of view
 Camera source: picamera2
 Fire detector running in its own process, classes=['Fire', 'Smoke']
 ```
+
+If it says `Camera source: none` instead, the Pi did not find the camera at boot; see
+[Troubleshooting → Video](#video).
 
 And from your computer, the full check:
 
@@ -527,8 +634,17 @@ Scan the QR code with **Expo Go** (Android: the scan button inside Expo Go; iPho
 Camera app). The app reloads by itself when the code changes.
 
 After installing a new native package, or pulling a version that added one, stop the
-server with **Ctrl+C** and run `npx expo start` again; a running server does not pick
-up new native modules.
+server with **Ctrl+C** and start it with `npx expo start --clear`; a running server does
+not pick up new native modules, and `--clear` drops the old app code it cached. Then
+close Expo Go fully on the phone and scan the QR code again.
+
+**The app and the rover must be updated together** when the control link changes. An
+app older than the rover cannot answer its challenge: the rover drops it after 5 seconds
+and logs `no answer to the challenge (an app older than this rover)`.
+
+The app uses these native modules, all included in Expo Go: `react-native-webview`
+(video), `react-native-gesture-handler` (multi-touch controls), `expo-crypto` (secure
+random numbers for the handshake) and `expo-secure-store` (the token in the keystore).
 
 **As an installable APK**, to keep on the phone:
 
@@ -561,7 +677,9 @@ In the app, open **Settings** and enter:
 
 Press **Connect rover**. The app builds both URLs from the address
 (`http://<ip>:8000/frame.jpg` and `ws://<ip>:8000/control`). Add `:port` to the address
-if you changed `HTTP_PORT`. **Show full URLs** reveals them for hand editing.
+if you changed `HTTP_PORT`. **Show full URLs** reveals them for hand editing. The token
+is stored in the phone's keystore and never sent: Settings shows **Connected to rover
+(authenticated)** once the handshake succeeds.
 
 **How you know it worked**, in this order:
 
@@ -571,9 +689,10 @@ if you changed `HTTP_PORT`. **Show full URLs** reveals them for hand editing.
 4. Battery shows `—`: no battery monitor is wired, so there is no number to show. That
    is correct, not a bug.
 5. **MOTORS OFF ON ROVER** shows in orange until you enable the motors in Step 10.
-6. Play a fire video on another screen and point the Pi camera at it. A red **FIRE**
-   box appears on the flames, the **Fire Detected** warning appears, the detection is
-   listed under **Alerts** and placed on the **Map**.
+6. Play a fire video on another screen and point the Pi camera at it. An orange
+   **FIRE** box appears on the flames, drawn into the video by the rover, the **Fire
+   Detected** warning appears, the detection is listed under **Alerts** and placed on
+   the **Map**. The AR button turns the boxes off and on.
 
 If it does not connect: check the address, check that the phone is on the same network,
 and check that the network has no **client isolation**, which many guest and campus
@@ -697,15 +816,23 @@ the motors whatever the software is doing.
 
 ### Step 11. Tune it
 
-**Camera colour.** If the video looks pink or blue, open **Settings → Camera → Camera
-colour** in the app and pick a preset. It changes live. **Daylight** is the default,
-because automatic white balance turned a white wall pink in testing. If **every**
-preset looks pink, your camera is probably a **NoIR** module, which has no infrared
-filter. Set its colour profile in `rover.env` and restart:
+**Camera colour.** If the video looks slightly pink or blue, open **Settings → Camera →
+Camera colour** in the app and pick a preset. It changes live. **Daylight** is the
+default, because automatic white balance turned a white wall pink in testing.
+
+If **every** preset looks strongly pink or purple, it is not white balance. Measured on
+the test rover, the green channel averaged 0.6 to 21 out of 255 in every preset, against
+about 220 for red: green was being removed, not mis-weighted. That happens when the
+colour profile does not match the sensor, typically a **Camera Module v2 NoIR** (no
+infrared filter, usually a **black** board; the standard v2 is green) running the
+standard profile. Set the NoIR profile in `rover.env` and restart:
 
 ```bash
 CAMERA_TUNING=imx219_noir.json        # Camera Module v2 NoIR
 ```
+
+The log then starts with `Camera tuning: imx219_noir.json`. If colours get worse, the
+camera is a standard one: set `CAMERA_TUNING=` back to empty.
 
 **Camera field of view.** Set `CAMERA_HFOV` to your lens, or the 3D map places every
 detection at the wrong angle: Camera v2 is 62.2, v3 is 66, v3 Wide is 102. The rover
@@ -719,8 +846,10 @@ guesses; around 70 is a good everyday setting. Filtered results are counted in
 telemetry, not silently dropped.
 
 **Speed.** `DETECT_INTERVAL` sets the pause between model passes, `DETECT_THREADS` the
-model's CPU threads (2 is best on a Pi 4), `STREAM_FPS` the video frame rate. If the Pi
-runs hot, fit a heatsink or fan: a Pi 4 slows itself down from about 80 °C.
+model's CPU threads (2 is best on a Pi 4), `STREAM_FPS` the video frame rate. The thread
+count is applied **when the model loads**: NCNN fixes it then, and changing it later
+only produced a warning per layer per pass. If the Pi runs hot, fit a heatsink or fan:
+a Pi 4 slows itself down from about 80 °C.
 
 **Measured range.** Fit the ultrasonic sensor for measured rather than estimated
 distance. See [Ultrasonic range finding](#ultrasonic-range-finding).
@@ -754,7 +883,17 @@ sudo systemctl restart agni-rover
 journalctl -u agni-rover -n 30 --no-pager
 ```
 
-App changes reach Expo Go through `npx expo start`; an installed APK needs rebuilding.
+App changes reach Expo Go through `npx expo start` (with `--clear` after a native module
+changes); an installed APK needs rebuilding. When the rover's protocol changes, update
+the rover **and** the app before expecting them to connect.
+
+**If `agni-rover.service` changed** (the deploy copies it but cannot install it):
+
+```bash
+sudo cp ~/agni/agni-rover.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl restart agni-rover
+```
 
 **Day-to-day commands on the Pi**
 
@@ -768,6 +907,8 @@ App changes reach Expo Go through `npx expo start`; an installed APK needs rebui
 | Find the Pi's address | `hostname -I` |
 | Check free space | `df -h /` |
 | Check temperature | `vcgencmd measure_temp` |
+| Is the camera detected? | `rpicam-hello --list-cameras` (with the rover stopped) |
+| Shrink the log | `sudo journalctl --vacuum-size=20M` |
 
 ---
 
@@ -784,8 +925,14 @@ App changes reach Expo Go through `npx expo start`; an installed APK needs rebui
   hard stop and also releases SPRINT. All of them work while the stick is held.
 - The **L/R bars** show what each side of the car is being told to do right now: green
   forward, red reverse, blue while sprinting. They use the same mix as the Pi.
-- The **AR** button hides or shows the detection boxes. The flashlight and siren buttons
-  appear only when their pins are wired; the siren asks before it sounds.
+- The **AR** button switches the video between the rover's boxed stream and the plain
+  camera. The flashlight and siren buttons appear only when their pins are wired; the
+  siren asks before it sounds.
+- **ANOTHER DEVICE IS DRIVING** appears when a second phone holds the controls. Your
+  stick does nothing until it lets go (3 seconds after its last command); BRAKE still
+  works.
+- **MOTORS OFF ON ROVER** appears while `MOTOR_OUTPUT=0`: commands arrive, the wheels
+  are deliberately not driven.
 - A **Fire Detected** or **Smoke Detected** warning shows the latest detection, how
   long ago it was seen, and a button to see it on the map.
 - Switching tabs or leaving the app while driving stops the car.
@@ -796,9 +943,9 @@ crosshair to reset. The bin button clears the map; the Alerts tab keeps every de
 **Alerts.** Every detection of the session, filterable by fire or smoke, with its
 confidence and time. **Clear this session** empties it.
 
-**Settings.** The Pi address and token, the connection button, the model status and
-inference time, detection sensitivity, auto-siren, in-app alerts, camera quality
-(480p, 720p, 1080p) and camera colour.
+**Settings.** The Pi address and token, the connection button and its status message,
+the model status and inference time, detection sensitivity, auto-siren, in-app alerts,
+camera quality (480p, 720p, 1080p) and camera colour (shown only for the Pi camera).
 
 ---
 
@@ -808,27 +955,69 @@ inference time, detection sensitivity, auto-siren, in-app alerts, camera quality
 
 | Endpoint | Purpose | Auth |
 |---|---|---|
-| `GET /stream.mjpg` | continuous MJPEG video at `STREAM_FPS`; what the app shows | token |
-| `GET /frame.jpg` | one JPEG frame | token |
-| `GET /control` | WebSocket upgrade, see below | token |
+| `GET /stream.mjpg` | continuous MJPEG video at up to `STREAM_FPS`; `?overlay=1` draws the fire and smoke boxes onto it, as the app shows it | one-time ticket, or token |
+| `GET /frame.jpg` | one JPEG frame | frame ticket, or token |
+| `GET /control` | WebSocket upgrade, see below | challenge-response |
 | `POST /detections` | publish a detection from an external detector | token |
-| `GET /status` | liveness probe; no camera content and no control | open |
+| `GET /status` | liveness probe; the details need the token | open, minimal |
 
-The token may be sent as an `Authorization: Bearer` header or as a `?token=` query
-parameter. The stream carries `Access-Control-Allow-Origin: *` because the app reads it
-from a local page with no origin of its own; the token still gates every request.
+**The app never sends the token.** It authenticates the control socket by answering a
+challenge, then asks over that socket for a **ticket** to open the video. A stream
+ticket opens one stream and is then spent; a frame ticket lasts 30 seconds. Tools such
+as `curl` and `verify_rover.py` may still send the token itself, as an `Authorization:
+Bearer` header or a `?token=` parameter, but it then crosses the network in clear.
+
+Ten failed attempts from one address within a minute lock that address out for a
+minute (HTTP 429). The stream carries `Access-Control-Allow-Origin: *` because the app
+reads it from a local page with no origin of its own; a ticket or the token still
+gates every request.
 
 Each part of the stream has a `Content-Length` header, and the app reads parts by
 length rather than by searching for JPEG markers.
+
+### WebSocket, connecting
+
+`raspberry_pi/security.py` and `native/domain/crypto.ts` implement the same protocol
+and are checked against each other on known values.
+
+1. The rover sends `{"type": "challenge", "nonce": <128 random bits>}`.
+2. The app picks its own random `clientNonce` and replies
+   `{"type": "auth", "clientNonce", "mac": HMAC-SHA256(token, "agni-auth|nonce|clientNonce")}`.
+   The token itself is never sent.
+3. The rover checks the signature. A wrong one, or none within 5 seconds, closes the
+   socket with code `4401` and counts towards the lockout.
+4. Both sides derive a key for this connection only:
+   `HMAC-SHA256(token, "agni-session|nonce|clientNonce")`. The rover replies
+   `{"type": "authOk", "proof": HMAC-SHA256(key, "agni-server")}`, proving it holds
+   the token too. The app refuses a rover that cannot, so an impostor at the rover's
+   address is caught.
+5. Every message after that, both ways, is an envelope
+   `{"seq": n, "body": "<JSON as a string>", "mac": HMAC-SHA256(key, "c2r|n|body")}`
+   (`r2c` from the rover). The sequence must increase, so a replayed packet is dropped,
+   and a packet signed without the key is dropped, without closing the connection.
+
+A rover with no `ROVER_TOKEN` skips this and sends `{"type": "hello", "auth": "none"}`.
+An app that holds a token refuses such a rover, so the protection cannot be stripped
+by something pretending to be an open rover.
+
+Numbers must be finite: `NaN` and `Infinity` are refused at parse time, because the
+drive clamp once turned a `NaN` throttle into full speed. Messages over 16 KB close
+that one connection.
 
 ### WebSocket, app to rover
 
 | Message | Fields | Effect |
 |---|---|---|
-| `drive` | `throttle`, `steering`, `sprint` | sets motor power and refreshes the watchdog |
-| `brake` | none | hard stop: both motors shorted for 0.5 s, then released |
+| `drive` | `throttle`, `steering`, `sprint` | sets motor power and refreshes the watchdog; only from the device holding the controls |
+| `brake` | none | hard stop: both motors shorted for 0.5 s, then released; accepted from **any** connected device |
+| `ticket` | `purpose` (`stream` or `frame`) | asks for a ticket to open the video |
 | `device` | `device` (`flash` or `siren`), `enabled` | switches a GPIO output; telemetry confirms |
 | `settings` | `settings` object | sensitivity, auto-siren, location, camera quality, white balance |
+
+**One device drives at a time.** The first device to send `drive` holds the controls
+while its commands keep arriving. Another device's `drive` is refused, and that device
+is told so, until the holder has sent nothing for 3 seconds or disconnects. BRAKE is
+never locked out: anyone connected can stop the car.
 
 The app sends at most one `drive` every 50 ms, and repeats a held command every 120 ms.
 That repeat is the heartbeat the rover's watchdog listens for. A stop is always sent at
@@ -839,13 +1028,17 @@ movement takes over from it immediately.
 
 | Message | Carries |
 |---|---|
-| `telemetry` | rover name, battery, signal, motor output state, flashlight and siren availability and state, camera source, field of view, white balance availability, model status and inference time, ultrasonic status |
+| `telemetry` | rover name, battery, signal, motor output state, flashlight and siren availability and state, camera source, field of view, age of the newest camera frame, white balance availability, model status and inference time, ultrasonic status |
 | `detection` | one fire or smoke event: kind, confidence, percent-of-frame box, time |
 | `range` | one ultrasonic ping: distance, bearing, beam width, maximum range |
 | `settings` | the rover's settings after applying yours |
+| `ticket` | a ticket for the video, and how long it lasts |
+| `control` | whether this device holds the controls, and why not |
 
 Telemetry is sent on connect, every `TELEMETRY_INTERVAL` seconds, and immediately when
 a device changes state, including the auto-siren starting or timing out.
+`cameraFrameAgeMs` says how old the newest camera frame is: over 5 seconds, the app
+shows the camera as failed and reopens the stream.
 
 ### Unavailable is an em dash, never zero
 
@@ -864,20 +1057,22 @@ Roboflow dataset below, with classes `Fire` and `Smoke`, exported to NCNN at 640
 start and caches them.
 
 **How it runs on the rover.** The server starts the model in a separate process
-(`spawn`, not `fork`, so the child never inherits the camera's threads). Each pass, the
-server grabs a frame, shrinks it to the model's input width, and hands it over; the
-model returns boxes as percentages of the frame. The process runs with 2 threads at a
-lower CPU priority, so video and drive commands always come first. If it crashes, the
-server reports it in telemetry and starts a new one; the rover keeps driving
-throughout.
+(`spawn`, not `fork`, so the child never inherits the camera's threads). Each pass, it
+takes the frame hub's newest frame, shrinks it to the model's input width, and hands it
+over; the model returns boxes as percentages of the frame. The process runs with
+`DETECT_THREADS` threads, set before the network loads, at a lower CPU priority, so
+video and drive commands always come first. If it crashes, the server reports it in
+telemetry and starts a new one; the rover keeps driving throughout.
 
 **Tracking.** A box overlapping one from the previous pass keeps the same ID, so one
 fire updates one alert instead of creating a new one every pass. A track is forgotten
 `DETECT_TRACK_TTL` seconds after it was last seen.
 
-**On screen.** The rover re-sends a box on every pass in which the fire is still seen.
-The app draws boxes only while they keep arriving, and the window widens with the
-measured inference time so boxes do not blink between slow passes.
+**On screen.** Boxes that pass the sensitivity gate are drawn **onto the video** by the
+rover, in the same style as `model/live_test.py`, so the video shows exactly what the
+alerts show. A box stays for a few passes after it was last seen (at least 3 seconds,
+longer when inference is slow) so it does not blink between passes. The app draws
+boxes itself only for a camera URL that is not the rover's.
 
 **Format and size.** NCNN runs several times faster than a PyTorch checkpoint on the
 Pi. An export bakes its input size in, so `DETECT_IMGSZ` must match it. Class names are
@@ -1069,6 +1264,85 @@ system, so it has to be one. The rules are written out in full in
 
 ---
 
+## Security
+
+### What is protected
+
+| Threat | What stops it |
+|---|---|
+| Someone on the Wi-Fi reads your token from the traffic | it is never sent: the app answers a challenge instead |
+| Someone replays a captured command later | every message is numbered; an old number is refused |
+| Someone injects their own command into your connection | every message is signed with a per-connection key they do not have |
+| A device pretends to be the rover to take your app's commands | the rover must prove it holds the token; the app refuses one that cannot |
+| A captured video link is reused | video tickets work once (stream) or for 30 seconds (frame) |
+| Someone guesses the token | 128 random bits, and ten failures lock that address out for a minute |
+| A second phone with the token takes over mid-drive | one device drives at a time; the other is told, and can still brake |
+| A malformed command (`NaN`, huge numbers, 1 MB of junk) | refused at parse time; numbers must be finite; messages over 16 KB are dropped |
+| A slow or stuck phone stalls the rover for everyone | each client gets a 1 second send timeout and is dropped if it cannot keep up |
+| A connection that never authenticates | dropped after 5 seconds |
+| The token stored on the phone | in the Android Keystore or iOS Keychain, not plain storage |
+| The rover process is compromised | systemd sandboxing: no privilege gain, system folders read-only |
+
+`verify_rover.py` runs these attacks against a live rover and reports each one.
+
+### What is not protected, and why
+
+- **The video and telemetry are not encrypted.** Anyone on the Wi-Fi can watch the
+  stream. Encrypting it needs TLS, and the app cannot trust a self-signed certificate
+  without a native rebuild per rover. Treat the rover's Wi-Fi as able to see what the
+  camera sees.
+- **Nothing on Wi-Fi can stop someone jamming it** or forcing devices off the network
+  with deauthentication frames. What this design guarantees is that losing the link can
+  only ever **stop** the car: the watchdog cuts the motors 0.45 s after the last command.
+  A router with WPA3, or WPA2 with **Protected Management Frames (802.11w)** enabled,
+  makes forced disconnects much harder.
+- **Anyone who learns the token has full control.** Keep `rover.env` private (it is
+  `chmod 600`), do not paste the token into chats or screenshots, and change it if it
+  leaks: generate a new one with `openssl rand -hex 16`, put it in `ROVER_TOKEN`,
+  restart, and enter it in the app.
+- **Tools that send the token directly** (`curl`, `verify_rover.py`) expose it on the
+  network. Run them on a network you trust.
+
+### Hardening the Pi
+
+Run these on the Pi. Each one is optional, and each makes the rover harder to attack.
+
+**1. SSH keys only, no passwords.** Do this only after [Step 5](#step-5-set-up-ssh-keys)
+works, or you will lock yourself out:
+
+```bash
+echo "PasswordAuthentication no" | sudo tee /etc/ssh/sshd_config.d/10-keys-only.conf
+sudo systemctl restart ssh
+```
+
+Check from your computer, in a **new** terminal, that `ssh pi@agni-rover.local` still
+logs in before closing the old one.
+
+**2. A firewall that allows only SSH and the rover:**
+
+```bash
+sudo apt install -y ufw
+sudo ufw allow 22/tcp
+sudo ufw allow 8000/tcp
+sudo ufw enable
+```
+
+**3. The sandboxed service file.** After deploying, install the updated unit and
+restart:
+
+```bash
+sudo cp ~/agni/agni-rover.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl restart agni-rover
+journalctl -u agni-rover -n 30 --no-pager      # check the camera and model started
+```
+
+**4. Keep it updated:** `sudo apt update && sudo apt full-upgrade -y` now and then.
+
+**5. A strong Pi password**, even with SSH keys, for the monitor and `sudo`: `passwd`.
+
+---
+
 ## Development and verification
 
 ```bash
@@ -1117,6 +1391,12 @@ same path the app does and names the first thing that broke.
 | Installed APK cannot connect, Expo Go can | the APK predates the cleartext setting; rebuild it |
 | `ssh: Permission denied` | wrong username or password, or the key was not installed; repeat [Step 5](#step-5-set-up-ssh-keys) |
 | `WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED` | you re-flashed the card. On your computer: `ssh-keygen -R agni-rover.local` |
+| "The rover rejected the access token" | the token in Settings does not match `ROVER_TOKEN` in `~/agni/rover.env`. The app stops retrying so it does not trigger the lockout |
+| "This rover is not asking for a token" | `ROVER_TOKEN` is empty on the rover, or something else answers at its address. Set the token, or clear it in the app for an open bench rover |
+| "The rover could not prove it has this token" | a different token on each side, or another device is impersonating the rover. Check `rover.env` |
+| HTTP 429, or the app cannot connect for a minute | ten failed attempts from your address; wait a minute |
+| An old app version cannot connect to an updated rover | the control link changed; restart `npx expo start` or rebuild the APK |
+| **ANOTHER DEVICE IS DRIVING** on the Control screen | a second phone holds the controls; it releases them 3 s after its last command. BRAKE still works |
 
 ### Video
 
@@ -1124,10 +1404,35 @@ same path the app does and names the first thing that broke.
 |---|---|
 | Video blinks | an old app version that swapped single frames; update the app |
 | Video lags or stutters | check `verify_rover.py`'s `Live stream` rate. Below about 10 fps: confirm the log says `Fire detector running in its own process`, keep `DETECT_THREADS=2`, check the temperature, or lower `STREAM_FPS` |
-| Video looks pink | pick **Daylight** or another preset in Settings → Camera colour; if all look pink, set `CAMERA_TUNING=imx219_noir.json` |
+| Video slightly pink or blue | pick **Daylight** or another preset in Settings → Camera colour |
 | "Pi camera unavailable, retrying" | the stream stalled or the rover restarted; it reconnects by itself. If it persists, check `journalctl -u agni-rover` |
-| `Camera source: none` in the log | the camera is not detected: reseat the ribbon with the Pi off, then check `rpicam-hello --list-cameras` |
+| `Camera source: none` in the log, or `rpicam-hello` says `No cameras available!` | the Pi did not find the camera at boot. See **Camera not detected** below |
+| Video strongly pink or purple in every colour preset | colour profile mismatch, typically a NoIR camera: set `CAMERA_TUNING=imx219_noir.json`; see [Step 11](#step-11-tune-it) |
 | `rpicam-hello` says the camera is busy | the rover owns the camera. `sudo systemctl stop agni-rover` first, then start it again |
+
+**Camera not detected.** If the boot log has
+
+```
+imx219 10-0010: failed to read chip id 219
+imx219 10-0010: probe with driver imx219 failed with error -121
+```
+
+or `vcgencmd get_camera` shows `detected=0`, the Pi cannot reach the camera through the
+ribbon at all. No software setting fixes that. It happened on the test rover after the
+motors were wired. With the Pi **powered off** (`sudo poweroff`, then unplug):
+
+1. The cable is in the **CAMERA** socket (between the HDMI ports and the audio jack on a
+   Pi 4), not **DISPLAY** (by the SD card).
+2. At the Pi, the **silver contacts face the HDMI ports**; at the camera, they face the
+   board. Each latch is closed and the cable does not slide when tugged gently.
+3. The **small connector on the camera board** that joins the lens block to the board is
+   pressed fully home. It works loose easily.
+4. The ribbon has no crease, cut or sharp fold, especially near the wheels. Try a spare,
+   or the same cable the other way round.
+
+Power on, then check `rpicam-hello --list-cameras` lists `imx219` before restarting the
+rover. The camera is only detected at boot, and connecting it powered can damage it.
+Tape the ribbon to the chassis so it cannot flex near the wheels.
 
 ### Detection
 
@@ -1160,7 +1465,72 @@ same path the app does and names the first thing that broke.
 | Rover exits straight after a restart, with no log | a source file on the Pi is empty or broken. Check `wc -l ~/agni/rover_server.py`, then redeploy; `deploy.sh` now verifies every file |
 | SD card filling up | an old install pulled NVIDIA GPU libraries. On the Pi: `python3 -m pip cache purge`, then reinstall CPU-only PyTorch: `python3 -m pip install --break-system-packages --no-cache-dir --force-reinstall --no-deps --index-url https://download.pytorch.org/whl/cpu torch torchvision` and remove the `nvidia-*`, `cuda-*` and `triton` packages |
 | Pi slows down when hot | above about 80 °C it throttles; fit a heatsink or fan. Check with `vcgencmd measure_temp` |
+| Log full of `opt.num_threads 2 changed, convolution ... will use load-time value 4` | an older `fire_detector.py` that limited threads after loading. Deploy the current one, restart, then `sudo journalctl --vacuum-size=20M` |
+| The app connects from the PC check but not from the phone, and the rover log shows nothing | the phone runs an older app. Restart with `npx expo start --clear`, close and reopen Expo Go; or rebuild the APK |
 | Changes on the PC do not show on the rover | deploy them and restart; see [Updating the rover](#updating-the-rover-after-a-code-change) |
+
+---
+
+## Change log
+
+What changed while bringing the rover up on real hardware, why, and how each change was
+checked. Measurements are from the Pi 4 described under
+[Measured performance](#measured-performance).
+
+### Connection and security
+
+| Problem found | Change | Checked by |
+|---|---|---|
+| The token travelled in clear in every video URL; anyone on the Wi-Fi could read it and drive | challenge-response with HMAC-SHA256; the token is never sent | `verify_rover.py`: wrong token refused, token never sent |
+| Commands had no integrity check | every message numbered and signed with a per-connection key, both ways | replayed, forged and unsigned commands ignored; session survives |
+| Nothing stopped a device impersonating the rover | the rover proves it holds the token; the app refuses one that cannot | the app's gateway run against an impostor server: refused |
+| A `{"throttle": NaN}` command meant full speed | `NaN` and `Infinity` refused at parse time; numbers must be finite | a correctly signed `NaN` command: wheels stay at 0 |
+| Unlimited token guesses | ten failures from one address lock it out for a minute | 9 refusals, then HTTP 429, even for the right token |
+| Any second phone could take over mid-drive | one device drives at a time; BRAKE works from any | second device refused while the first drove, then stopped the car |
+| One slow phone could stall telemetry and the watchdog | concurrent sends with a 1 s timeout; the watchdog never waits on the network | code review; broadcast and watchdog paths |
+| `/status` revealed motor state to anyone | minimal without the token | `verify_rover.py` |
+| Token kept in plain app storage | Android Keystore / iOS Keychain, migrated from the old copy | type-check and bundle |
+| Rover process could use `sudo` | systemd sandbox: `NoNewPrivileges`, read-only system folders | `systemctl show` on the Pi: `NoNewPrivileges=yes`, `ProtectSystem=full` |
+| An app older than the rover failed silently | the rover logs `no answer to the challenge` | code path |
+| The app's crypto had to match Python's exactly | SHA-256, HMAC and sessions cross-checked against Python | 9 of 9 values identical, including RFC 4231 test 1 |
+
+### Video
+
+| Problem found | Change | Checked by |
+|---|---|---|
+| The feed blinked: the app swapped one photo for the next and Android blanked it each time | continuous MJPEG stream | stream at 13 to 15 fps |
+| The camera saw 39° of its 62°: a centre-cropped sensor mode | the rover picks the full-view sensor mode (1640×1232 on a v2) | log: `Camera sensor mode: 1640x1232, full field of view` |
+| Video lagged: each viewer captured and encoded on its own timer, and the app painted frames from script | one frame hub captures and encodes once and pushes immediately; the app shows a native `<img>`, as `live_test.py` does | both variants at once at 12.8 fps; page tested in headless Chrome |
+| App-drawn boxes could drift from the picture | the rover draws boxes onto the frame (`?overlay=1`); AR switches it | drawn test frame inspected |
+| A frozen camera looked live | telemetry reports the newest frame's age; the app reopens the stream | code path; stream ends after 3 s without a frame |
+| Video pink in every white-balance preset: green near zero | NoIR colour profile via `CAMERA_TUNING`; live white-balance presets in Settings | channel means per preset measured on the Pi |
+| "Camera not working" after wiring the motors | no software change: error -121, `detected=0`; ribbon reseat guide | kernel log and `vcgencmd get_camera` on the Pi |
+
+### Model and performance
+
+| Problem found | Change | Checked by |
+|---|---|---|
+| The model froze the whole server for 0.4 s of every 0.5 s | the model runs in its own supervised process, at lower priority | `/status` from 340 ms to 3 ms; video from 1.9 to 14.3 fps; crash recovery tested |
+| Model threads changed after load had no effect and logged 61,000 warnings in 10 minutes | the thread count is set before the network loads | on the Pi: `ThreadLimitedNet`, 2 threads at load, no warnings |
+| 4 GB of NVIDIA libraries and a 3.3 GB download cache on the SD card | CPU-only PyTorch, `--no-cache-dir` | 17.3 GB used down to 8.8 GB; model loads and runs |
+
+### Driving
+
+| Problem found | Change | Checked by |
+|---|---|---|
+| SPRINT, BRAKE and ACCEL ignored while a thumb held the stick | multi-touch joystick on `react-native-gesture-handler` | bundle; tested on the phone |
+| BRAKE only cut power, so the car coasted | hard brake: both motor inputs high for 0.5 s, then released | pin log: all four inputs high at 100 % for 0.5 s |
+| Switching tabs mid-drive kept the car driving | the Control screen stops the car when it goes away; so does leaving the app | code path |
+| Sprint had to be held with a third thumb | SPRINT latches on a tap | used on the phone |
+
+### Deploy and setup
+
+| Problem found | Change | Checked by |
+|---|---|---|
+| An empty file reached the Pi and the rover exited silently at boot | `deploy.sh` refuses empty files and checks every copy byte for byte | redeploy: `service files copied and verified` |
+| An installed APK could not reach the rover | `usesCleartextTraffic` for plain `http`/`ws` on the local network | build config |
+| `python3-rpi.gpio` on current Raspberry Pi OS | documented: keep `python3-rpi-lgpio` | `GPIO ok` on the Pi |
+| Entering two URLs by hand | the app asks for the Pi's address and builds both | 13 inputs tested, valid and invalid |
 
 ---
 

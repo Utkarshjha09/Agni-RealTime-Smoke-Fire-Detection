@@ -79,7 +79,11 @@ screen that only works when everything is connected is not finished.
 - **Keep the watchdog.** The motors stop if no command arrives for `CONTROL_TIMEOUT`
   seconds, and when the last operator disconnects. Do not remove or lengthen it
   casually; it is what stops a rover whose operator walked out of Wi-Fi range.
-- **Keep token auth.** Never widen network access without it.
+- **Keep token auth, and keep it off the wire.** The app proves the token with a
+  challenge-response and signs every control message (`security.py` and
+  `domain/crypto.ts`, one protocol); video opens with one-time tickets. Never send
+  the token in an app URL, never accept an unsigned command on an authenticated
+  socket, and never lock BRAKE behind the driver lock.
 - **Loud or physical actions get a confirmation.** The siren asks first.
 - A background task must never be able to take the server down or leave the wheels
   energised. Catch broadly in the loops, report the error in telemetry, keep driving.

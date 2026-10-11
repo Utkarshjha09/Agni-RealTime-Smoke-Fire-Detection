@@ -1,9 +1,9 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { AppState } from "react-native";
 import type { ConnectionState, Detection, DriveMotion, RangeReading, RobotEndpoints, RobotSettings, RobotTelemetry } from "../../domain/robot";
-import { VALUE_UNAVAILABLE, streamUrlFor, withToken } from "../../domain/robot";
+import { VALUE_UNAVAILABLE, streamUrlFor } from "../../domain/robot";
 import { clampUnit } from "../../domain/drive";
-import { brakeRobot, connectRobot, defaultEndpoints, disconnectRobot, sendDeviceAction, sendMotion, sendSettings } from "../../services/robotGateway";
+import { brakeRobot, connectRobot, defaultEndpoints, disconnectRobot, requestTicket, sendDeviceAction, sendMotion, sendSettings } from "../../services/robotGateway";
 import { POINT_TTL_MS } from "../../domain/rangeMap";
 import { loadEndpoints, loadSettings, saveEndpoints, saveSettings } from "../../services/storage";
 
@@ -38,6 +38,11 @@ type RobotSession = {
   onCameraLoad: () => void;
   onCameraError: () => void;
   onStreamError: () => void;
+  /** Set while another device holds the controls; this phone's stick is ignored. */
+  controlNotice: string | null;
+  /** Boxes drawn onto the video by the rover (AR on), or the plain camera. */
+  overlay: boolean;
+  setOverlay: (on: boolean) => void;
   drive: (throttle: number, steering: number, sprint: boolean) => void;
   brake: () => void;
   setDeviceAction: (device: "flash" | "siren", enabled: boolean) => boolean;
@@ -73,6 +78,7 @@ const offlineTelemetry: RobotTelemetry = {
   detectorError: "",
   suppressedDetections: 0,
   cameraHfovDeg: 0,
+  cameraFrameAgeMs: VALUE_UNAVAILABLE,
   whiteBalanceAvailable: false,
   rangeSensorActive: false,
   rangeSensorError: "",
@@ -96,6 +102,9 @@ export function RobotProvider({ children }: { children: ReactNode }) {
   const [cameraState, setCameraState] = useState<CameraState>("idle");
   const [cameraTick, setCameraTick] = useState(Date.now());
   const [streamAttempt, setStreamAttempt] = useState(0);
+  const [streamUrl, setStreamUrl] = useState("");
+  const [controlNotice, setControlNotice] = useState<string | null>(null);
+  const [overlay, setOverlay] = useState(true);
   // The drive command lives in refs, not state. A stick reports dozens of moves a
   // second; as state, each one re-rendered every screen (camera included) before
   // the packet could leave. Now a move goes straight to the socket.
@@ -156,11 +165,13 @@ export function RobotProvider({ children }: { children: ReactNode }) {
           setRangeReadings([]);
           // A stick held through a dropout must not resume driving on reconnect.
           resetMotion();
+          setControlNotice(null);
         }
       },
       onTelemetry: packet => setTelemetry(current => ({ ...current, ...packet })),
       onDetection: receiveDetection,
       onRange: receiveRange,
+      onControl: (driving, reason) => setControlNotice(driving ? null : reason ?? "Another device is driving"),
     });
   }, [endpoints, receiveDetection, receiveRange, resetMotion]);
 
@@ -277,18 +288,43 @@ export function RobotProvider({ children }: { children: ReactNode }) {
     setTimeout(() => setStreamAttempt(attempt => attempt + 1), 2000);
   }, []);
 
-  const streamUrl = useMemo(() => {
-    if (connectionState !== "connected") return "";
-    const stream = streamUrlFor(endpoints.cameraUrl);
-    return stream ? withToken(stream, endpoints.token) : "";
-  }, [connectionState, endpoints.cameraUrl, endpoints.token]);
+  // The rover's stream, opened with a one-time ticket from the authenticated
+  // socket. The token never appears in a URL, where anyone on the Wi-Fi could read
+  // it; a captured ticket is already spent. Each retry asks for a fresh one.
+  const streamBase = connectionState === "connected" ? streamUrlFor(endpoints.cameraUrl) : "";
+  useEffect(() => {
+    setStreamUrl("");
+    if (!streamBase) return;
+    let cancelled = false;
+    void requestTicket("stream").then(ticket => {
+      if (cancelled) return;
+      if (!ticket) {
+        onStreamError();
+        return;
+      }
+      setStreamUrl(`${streamBase}?ticket=${encodeURIComponent(ticket)}${overlay ? "&overlay=1" : ""}`);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // A change of overlay needs a new stream, and so a new one-time ticket.
+  }, [onStreamError, overlay, streamAttempt, streamBase]);
 
+  // The rover says how old its newest camera frame is. A camera that stopped
+  // delivering is shown as failed and the stream reopened, rather than the last
+  // picture staying on screen looking live.
+  const cameraStale = streamBase !== "" && telemetry.cameraFrameAgeMs > FRAME_STALL_MS;
+  useEffect(() => {
+    if (cameraStale) onStreamError();
+  }, [cameraStale, onStreamError]);
+
+  // Polled frames, only for a camera URL that is not the rover's: another server,
+  // so the rover's token is never attached to it.
   const cameraUrl = useMemo(() => {
-    if (connectionState !== "connected" || !endpoints.cameraUrl || streamUrl) return "";
-    const authed = withToken(endpoints.cameraUrl, endpoints.token);
-    const separator = authed.includes("?") ? "&" : "?";
-    return `${authed}${separator}t=${cameraTick}`;
-  }, [cameraTick, connectionState, endpoints.cameraUrl, endpoints.token, streamUrl]);
+    if (connectionState !== "connected" || !endpoints.cameraUrl || streamUrlFor(endpoints.cameraUrl)) return "";
+    const separator = endpoints.cameraUrl.includes("?") ? "&" : "?";
+    return `${endpoints.cameraUrl}${separator}t=${cameraTick}`;
+  }, [cameraTick, connectionState, endpoints.cameraUrl]);
 
   // Each frame URL is requested once. If neither onLoad nor onError arrives the
   // chain stops, and the last frame would sit on screen looking live. Every new
@@ -326,10 +362,13 @@ export function RobotProvider({ children }: { children: ReactNode }) {
     onCameraLoad,
     onCameraError,
     onStreamError,
+    controlNotice,
+    overlay,
+    setOverlay,
     drive,
     brake,
     setDeviceAction: sendDeviceAction,
-  }), [brake, cameraState, cameraUrl, clearDetections, clearMap, mapClearedAt, onStreamError, streamAttempt, streamUrl, connect, connectionMessage, connectionState, detections, disconnect, drive, endpoints, onCameraError, onCameraLoad, rangeReadings, ready, settings, telemetry, updateSettings]);
+  }), [brake, cameraState, cameraUrl, clearDetections, clearMap, controlNotice, mapClearedAt, onStreamError, overlay, streamAttempt, streamUrl, connect, connectionMessage, connectionState, detections, disconnect, drive, endpoints, onCameraError, onCameraLoad, rangeReadings, ready, settings, telemetry, updateSettings]);
 
   return <RobotContext.Provider value={value}>{children}</RobotContext.Provider>;
 }

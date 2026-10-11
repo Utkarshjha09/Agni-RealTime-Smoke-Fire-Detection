@@ -28,6 +28,7 @@ server-side sensitivity gate, so you see everything the model reports at --conf.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import threading
 import time
@@ -40,6 +41,20 @@ DEFAULT_WEIGHTS = HERE / "weights" / "best_nano_111_ncnn_model"
 
 # BGR, matching the app: fire is orange, smoke is grey-blue.
 COLOURS = {"fire": (40, 120, 255), "smoke": (200, 170, 140)}
+
+
+def open_camera(index: int, cv2):
+    """Try the common Windows backends because laptop webcams vary by driver."""
+    backends = [("default", 0)]
+    if sys.platform == "win32":
+        backends = [("default", 0), ("Media Foundation", cv2.CAP_MSMF), ("DirectShow", cv2.CAP_DSHOW)]
+    for name, backend in backends:
+        capture = cv2.VideoCapture(index, backend)
+        if capture.isOpened():
+            print(f"camera {index} opened with {name}")
+            return capture
+        capture.release()
+    return None
 
 
 class Stats:
@@ -143,6 +158,108 @@ Boxes are drawn on anything the model reports. Stop it with <code>Ctrl+C</code> 
 """
 
 
+def browser_camera_page(conf: float) -> bytes:
+    return f"""<!doctype html>
+<title>Agni detector</title>
+<style>
+  body {{ margin: 0; background: #0b0f14; color: #e8edf3;
+         font: 14px system-ui, -apple-system, Segoe UI, sans-serif;
+         display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 20px; }}
+  h1 {{ font-size: 16px; font-weight: 600; margin: 0; letter-spacing: .01em; }}
+  #stage {{ position: relative; max-width: min(100%, 1100px); }}
+  video, canvas {{ width: 100%; border-radius: 10px; border: 1px solid #22303d; }}
+  #overlay {{ position: absolute; inset: 0; pointer-events: none; }}
+  p {{ margin: 0; color: #8fa3b5; max-width: 60ch; text-align: center; line-height: 1.5; }}
+  .status {{ color: #cfe3f5; }}
+</style>
+<h1>Agni fire and smoke detector, live</h1>
+<div id="stage">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="overlay"></canvas>
+</div>
+<p class="status" id="status">Starting camera...</p>
+<p>Chrome owns the webcam. Frames are sent to the local Python model and boxes are drawn from real detections.</p>
+<script>
+const video = document.getElementById('video');
+const overlay = document.getElementById('overlay');
+const statusEl = document.getElementById('status');
+const capture = document.createElement('canvas');
+const ctx = capture.getContext('2d');
+const out = overlay.getContext('2d');
+let busy = false;
+
+function resizeCanvas() {{
+  const w = video.videoWidth || 640;
+  const h = video.videoHeight || 480;
+  capture.width = w;
+  capture.height = h;
+  overlay.width = w;
+  overlay.height = h;
+}}
+
+function drawBoxes(detections, inferenceMs) {{
+  resizeCanvas();
+  out.clearRect(0, 0, overlay.width, overlay.height);
+  out.font = '18px system-ui, sans-serif';
+  out.lineWidth = 3;
+  for (const det of detections) {{
+    const b = det.boundingBox;
+    const x = b.left / 100 * overlay.width;
+    const y = b.top / 100 * overlay.height;
+    const w = b.width / 100 * overlay.width;
+    const h = b.height / 100 * overlay.height;
+    const color = det.kind === 'fire' ? '#ff7a2f' : '#8fb4c8';
+    out.strokeStyle = color;
+    out.fillStyle = color;
+    out.strokeRect(x, y, w, h);
+    const label = `${{det.kind.toUpperCase()}} ${{det.confidence.toFixed(0)}}%`;
+    const text = out.measureText(label);
+    out.fillRect(x, Math.max(0, y - 28), text.width + 12, 26);
+    out.fillStyle = '#111820';
+    out.fillText(label, x + 6, Math.max(18, y - 9));
+  }}
+  statusEl.textContent = detections.length
+    ? `${{detections.length}} detection(s), ${{inferenceMs.toFixed(0)}} ms`
+    : `nothing detected, ${{inferenceMs.toFixed(0)}} ms, conf >= {conf:.2f}`;
+}}
+
+async function sendFrame() {{
+  if (busy || video.readyState < 2) return;
+  busy = true;
+  resizeCanvas();
+  ctx.drawImage(video, 0, 0, capture.width, capture.height);
+  const blob = await new Promise(resolve => capture.toBlob(resolve, 'image/jpeg', 0.82));
+  try {{
+    const response = await fetch('/detect', {{ method: 'POST', body: blob }});
+    const data = await response.json();
+    drawBoxes(data.detections, data.inferenceMs);
+  }} catch (error) {{
+    statusEl.textContent = `Detector request failed: ${{error}}`;
+  }} finally {{
+    busy = false;
+  }}
+}}
+
+async function start() {{
+  try {{
+    video.srcObject = await navigator.mediaDevices.getUserMedia({{
+      video: {{ width: {{ ideal: 1280 }}, height: {{ ideal: 720 }} }},
+      audio: false
+    }});
+    video.onloadedmetadata = () => {{
+      resizeCanvas();
+      statusEl.textContent = 'Camera ready. Point it at a real flame or fire video.';
+      setInterval(sendFrame, 450);
+    }};
+  }} catch (error) {{
+    statusEl.textContent = `Camera permission failed: ${{error}}`;
+  }}
+}}
+start();
+</script>
+""".encode("utf-8")
+
+
 def make_handler(latest: LatestFrame):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args) -> None:
@@ -182,6 +299,86 @@ def make_handler(latest: LatestFrame):
     return Handler
 
 
+def make_browser_camera_handler(model, cv2, conf: float, imgsz: int):
+    page = browser_camera_page(conf)
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args) -> None:
+            pass
+
+        def do_GET(self) -> None:
+            if self.path not in ("/", "/index.html"):
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(page)))
+            self.end_headers()
+            self.wfile.write(page)
+
+        def do_POST(self) -> None:
+            if self.path != "/detect":
+                self.send_error(404)
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            data = self.rfile.read(length)
+            try:
+                import numpy as np
+
+                encoded = np.frombuffer(data, dtype=np.uint8)
+                frame = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+                if frame is None:
+                    raise ValueError("could not decode frame")
+                started = time.perf_counter()
+                results = model.predict(source=frame, imgsz=imgsz, conf=conf, iou=0.45, verbose=False)
+                inference_ms = round((time.perf_counter() - started) * 1000, 1)
+                height, width = frame.shape[:2]
+                detections = []
+                for result in results:
+                    for box in getattr(result, "boxes", []) or []:
+                        kind = classify(model.names.get(int(box.cls[0]), ""))
+                        if kind is None:
+                            continue
+                        x1, y1, x2, y2 = (float(value) for value in box.xyxy[0])
+                        detections.append({
+                            "kind": kind,
+                            "confidence": round(float(box.conf[0]) * 100, 1),
+                            "boundingBox": {
+                                "left": round(max(0.0, x1) / width * 100, 2),
+                                "top": round(max(0.0, y1) / height * 100, 2),
+                                "width": round(max(0.0, x2 - x1) / width * 100, 2),
+                                "height": round(max(0.0, y2 - y1) / height * 100, 2),
+                            },
+                        })
+                body = json.dumps({"detections": detections, "inferenceMs": inference_ms}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception as error:  # noqa: BLE001 - report to the local test page.
+                body = json.dumps({"error": str(error), "detections": [], "inferenceMs": 0}).encode("utf-8")
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+    return Handler
+
+
+def serve_browser_camera(model, cv2, conf: float, imgsz: int, port: int) -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", port), make_browser_camera_handler(model, cv2, conf, imgsz))
+    print(f"\n  open  http://127.0.0.1:{port}  in your browser\n")
+    print("Chrome will ask for camera permission. Ctrl+C here stops the test.\n")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--weights", type=Path, default=DEFAULT_WEIGHTS, help="weights or NCNN folder")
@@ -191,6 +388,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8777, help="port for the browser view")
     parser.add_argument("--window", action="store_true", help="desktop window; needs the full opencv-python")
     parser.add_argument("--headless", action="store_true", help="no video at all, print detections only")
+    parser.add_argument("--browser-camera", action="store_true", help="use Chrome's webcam access and send frames to Python")
     args = parser.parse_args()
 
     try:
@@ -209,10 +407,15 @@ def main() -> int:
     model = YOLO(str(args.weights), task="detect")
     print(f"classes: {list(model.names.values())}")
 
-    capture = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW if sys.platform == "win32" else 0)
-    if not capture.isOpened():
-        print(f"Could not open camera {args.camera}. Is another program using it?", file=sys.stderr)
-        return 2
+    if args.browser_camera:
+        serve_browser_camera(model, cv2, args.conf, args.imgsz, args.port)
+        return 0
+
+    capture = open_camera(args.camera, cv2)
+    if capture is None:
+        print(f"Could not open camera {args.camera}. Falling back to browser camera.", file=sys.stderr)
+        serve_browser_camera(model, cv2, args.conf, args.imgsz, args.port)
+        return 0
     capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 

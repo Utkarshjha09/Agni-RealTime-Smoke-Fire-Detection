@@ -77,6 +77,8 @@ export interface RobotTelemetry {
   suppressedDetections: number;
   /** Camera horizontal field of view in degrees, used to turn boxes into bearings. */
   cameraHfovDeg: number;
+  /** Milliseconds since the rover's camera last delivered a frame, or VALUE_UNAVAILABLE. */
+  cameraFrameAgeMs: number;
   /** True when the camera takes white balance presets (the Pi camera; not a webcam). */
   whiteBalanceAvailable: boolean;
   /** True when an ultrasonic sensor is wired and being read. */
@@ -110,13 +112,6 @@ export interface RobotSettings {
   showLocation: boolean;
   cameraQuality: CameraQuality;
   whiteBalance: WhiteBalance;
-}
-
-/** Appends the shared secret the Pi expects, preserving any existing query. */
-export function withToken(url: string, token: string): string {
-  if (!url || !token) return url;
-  const separator = url.includes("?") ? "&" : "?";
-  return `${url}${separator}token=${encodeURIComponent(token)}`;
 }
 
 export function isHttpUrl(url: string): boolean {

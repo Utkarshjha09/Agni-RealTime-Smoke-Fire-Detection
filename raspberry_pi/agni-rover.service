@@ -32,9 +32,18 @@ TimeoutStopSec=5
 Restart=on-failure
 RestartSec=3
 
-# Picamera2 and GPIO need the real devices, so this is deliberately not a
-# hardened sandbox. It does get its own /tmp.
+# Picamera2 and GPIO need the real devices, so /dev stays open. Everything below
+# limits what an attacker could do with the process if they ever got code running
+# in it: no gaining privileges (sudo, setuid), system folders read-only, no kernel
+# tuning or modules. None of it is needed to drive, film or detect.
 PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
 
 StandardOutput=journal
 StandardError=journal
