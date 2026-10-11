@@ -4,14 +4,45 @@ export function clampUnit(value: number): number {
   return Math.max(-1, Math.min(1, value));
 }
 
-/** Stick plus accelerator, as one throttle value.
+/** The three pedal states the drive buttons can be in. */
+export type Pedals = {
+  /** ACCEL is held down. */
+  accel: boolean;
+  /** BRAKE is held down. */
+  brake: boolean;
+  /** Cruise is latched: ACCEL was pressed with SPRINT on, and the car keeps going. */
+  cruise: boolean;
+};
+
+/** Forward, reverse or nothing, from the pedals alone, as -1, 0 or 1.
  *
- * The accelerator adds full forward drive, so you can hold a turn on the stick and
- * accelerate through it with the other thumb. Pulling back on the stick while
- * accelerating cancels out rather than reversing.
+ * ACCEL and BRAKE held together reverse, the way a driving game reverses: the
+ * thumb that would stop the car turns the accelerator round. Cruise drives forward
+ * with no button held, as PUBG's auto-run does.
  */
-export function combinedThrottle(stickThrottle: number, accelerating: boolean): number {
-  return clampUnit(stickThrottle + (accelerating ? 1 : 0));
+export function pedalThrottle(pedals: Pedals): number {
+  if (pedals.accel && pedals.brake) return -1;
+  if (pedals.accel || pedals.cruise) return 1;
+  return 0;
+}
+
+/** Stick plus pedals, as one throttle value.
+ *
+ * The pedal adds full drive, so you can hold a turn on the stick and accelerate
+ * through it with the other thumb. Pulling back on the stick while accelerating
+ * cancels out rather than reversing.
+ */
+export function combinedThrottle(stickThrottle: number, pedal: number): number {
+  return clampUnit(stickThrottle + pedal);
+}
+
+export type DriveMode = "REVERSE" | "CRUISE" | "SPRINT" | "DRIVE";
+
+/** What the wheel display labels the current command. */
+export function driveMode(pedals: Pedals, sprint: boolean): DriveMode {
+  if (pedals.accel && pedals.brake) return "REVERSE";
+  if (pedals.cruise) return "CRUISE";
+  return sprint ? "SPRINT" : "DRIVE";
 }
 
 /** Left and right wheel command, -1..1, before the rover applies its duty ceiling.

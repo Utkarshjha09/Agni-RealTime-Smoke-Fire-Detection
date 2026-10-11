@@ -19,6 +19,62 @@ model/          Offline only  dataset, training, export, and a webcam test for t
 
 ---
 
+## Download the app
+
+**[Download Agni for Android (`release/agni-rover.apk`)](release/agni-rover.apk)**
+
+| | |
+|---|---|
+| Version | 1.0.0, built 2026-10-11 |
+| Size | 61 MB |
+| Platform | Android. On an iPhone, run it with Expo Go instead ([Step 7](#step-7-run-the-app)) |
+| Package | `com.nature21.agni` |
+| SHA-256 | `3400c33c61e879bba0fe349a99a5ddd2102de4471f23b511acb538da53aa6c79` |
+
+This build contains everything described in this README: the signed control link, the
+rover-drawn fire boxes on a native video view, the multi-touch drive buttons with cruise
+and reverse, and the token kept in the phone's keystore.
+
+**Install it**
+
+1. Open the link above **on the phone** and download the file.
+2. Open the downloaded `agni-rover.apk`. Android asks to allow installs from this source
+   (your browser or file manager): allow it for this install.
+3. If **Play Protect** warns that the app is from an unknown developer, that is because
+   it is not from the Play Store. Check the SHA-256 below first, then choose **Install
+   anyway**.
+4. Open **Agni**, go to **Settings**, enter the **Pi address** and **access token**, and
+   press **Connect rover** ([Step 8](#step-8-connect-the-app)).
+
+**Check the download** before installing it, so you know it is this exact file. On a
+computer:
+
+```powershell
+Get-FileHash agni-rover.apk -Algorithm SHA256      # Windows PowerShell
+```
+
+```bash
+sha256sum agni-rover.apk                            # macOS: shasum -a 256 agni-rover.apk
+```
+
+The result must equal the SHA-256 in the table. If it does not, do not install it.
+
+**It needs a rover running the matching version.** The app proves its token with a
+challenge and signs every command; a rover deployed before that change cannot answer
+it, and the app refuses a rover that does not ask. Deploy the rover from this same
+version of the repo ([Updating the rover](#updating-the-rover-after-a-code-change)).
+
+**Updating.** Install a newer APK over this one; your saved address, token and settings
+stay. Android only allows this when the new APK is signed with the same key. If it says
+*App not installed*, uninstall the old one first and enter the address and token again.
+
+> **On GitHub.** The APK is stored with Git LFS (61 MB). GitHub's free LFS bandwidth is
+> 1 GB a month, about 15 downloads. For a project people will download, attach the APK
+> to a **GitHub Release** instead (**Releases → Draft a new release → attach the file**)
+> and point the link above at it; Releases have no such limit.
+
+---
+
 ## See the model detect fire
 
 [![The fire model drawing a FIRE 68% box around a lighter flame, live on a webcam. Click to play the 38 second video.](docs/media/model-live-test.jpg)](docs/media/model-live-test.mp4)
@@ -73,9 +129,108 @@ python live_test.py            # then open http://127.0.0.1:8777
 
 ---
 
+## Screenshots
+
+All screenshots are from the app on an Android phone, 2026-10-11. The app has four tabs:
+**Control**, **Map**, **Alerts** and **Settings**.
+
+### Control, driving
+
+![The Control screen in landscape: the rover's live camera fills the screen, with the status bar at the top, the joystick bottom left, the L and R wheel bars and the ACCEL, SPRINT and BRAKE buttons bottom right, and the navigation rail on the left.](docs/screenshots/control-landscape.jpg)
+
+The cockpit, with the phone turned sideways and the rover's camera filling the screen.
+
+| Where | What it is |
+|---|---|
+| Top centre | status bar: Wi-Fi signal from the Pi (`-40dB`), battery (`—`, because no battery monitor is wired), GPS, **AI** (the model is running on the rover) and **LINK** (connected) |
+| Top right | **MOTORS OFF ON ROVER**: `MOTOR_OUTPUT=0`, so drive commands arrive but the wheels are not driven; and the AR button |
+| Left | the navigation rail: Control, Map, Alerts, Settings |
+| Bottom left | the joystick |
+| Bottom right | the L and R wheel bars, then **ACCEL**, **SPRINT** and **BRAKE** ([how they combine](#the-drive-buttons)) |
+
+Taken early in bring-up. Two things have changed since: the pink tint came from the
+camera's colour profile (see [Step 11](#step-11-tune-it)), and fire boxes are now drawn
+into the video by the rover.
+
+### Control, rover offline
+
+![The Control screen in landscape with no rover connected: the status bar reads dashes, NO GPS, NO AI and OFF; the middle says Rover offline, Enter the Pi's address and token in Settings, then connect, with an Open Settings button; the joystick and drive buttons are dimmed.](docs/screenshots/control-offline-landscape.jpg)
+
+With no rover, the screen says so rather than showing an empty or frozen picture. The
+status bar shows dashes, **NO AI** and **OFF**, the drive controls are dimmed, and
+**Open Settings** goes straight to where the address and token are entered.
+
+### Map, Alerts and Settings
+
+<table>
+  <tr>
+    <td align="center" width="33%"><img src="docs/screenshots/map-portrait.jpg" alt="The Map tab in portrait: an Area View title with 0 zones, a legend for fire, smoke and the rover with its camera view, a 2 metre ground grid with the rover at the origin and its camera's field of view drawn as a wedge, and TOP, zoom, reset and clear buttons on the right." width="260"></td>
+    <td align="center" width="33%"><img src="docs/screenshots/alerts-portrait.jpg" alt="The Alerts tab in portrait: an All, Fire and Smoke filter, 0 events, and a card reading Rover offline, Reconnecting to rover, with an Open Settings button." width="260"></td>
+    <td align="center" width="33%"><img src="docs/screenshots/settings-portrait.jpg" alt="The Settings tab in portrait: the Raspberry Pi rover connection card with the Pi address, a hidden access token and a Connecting button; the detection model status; detection sensitivity, auto-siren, in-app alerts and detection location; camera quality 720p; and About." width="200"></td>
+  </tr>
+  <tr>
+    <td align="center"><b>Map</b></td>
+    <td align="center"><b>Alerts</b></td>
+    <td align="center"><b>Settings</b></td>
+  </tr>
+</table>
+
+**Map.** The 3D area view, empty here because nothing has been detected (*0 zones*).
+The rover sits at the origin of a 2 metre grid, with its camera's real field of view
+drawn as the wedge in front of it; detections appear as markers placed by bearing. On the
+right: **TOP** for a top-down view, zoom in and out, reset the view, and clear the map.
+The note at the bottom says the rover is offline.
+
+**Alerts.** Every fire and smoke detection of the session, filtered by **All**, **Fire**
+or **Smoke**. Here there are none, and the card says why: the rover is offline and the
+app is reconnecting, with a shortcut to Settings. No sample alerts are ever shown.
+
+**Settings.** The connection card at the top: the **Pi address** (the app builds the
+URLs from it; **Show full URLs** reveals them), the **access token**, hidden as it is
+typed, and the connect button, here reading *Connecting* while the app retries. Below:
+the on-device model's status and inference time (dashes while offline), detection
+sensitivity at 74, auto-siren, in-app alerts and detection location, camera quality at
+720p, and About. **Camera colour** appears under Camera once a Pi camera is connected.
+
+These three were taken with the rover offline, which is the state they show.
+
+---
+
+## The rover
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/photos/rover-overview.jpg" alt="The rover from above: a clear acrylic four-wheel chassis with yellow gear motors and black tyres, a three-cell lithium battery holder on the left, a red L298N motor driver in the middle, and a Raspberry Pi 4 on the right with the camera's white ribbon cable." width="100%"></td>
+    <td width="50%"><img src="docs/photos/rover-side.jpg" alt="The rover from the side: the large yellow wheels, the Raspberry Pi 4 and the L298N with its wiring, and the three-cell battery holder." width="100%"></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/photos/rover-electronics.jpg" alt="A closer view of the electronics: the Raspberry Pi 4, the camera ribbon cable leaving it, and the L298N motor driver with the jumper wires between them." width="100%"></td>
+    <td width="50%"><img src="docs/photos/rover-top.jpg" alt="The rover from above, front to back: the Raspberry Pi 4 at the front, the L298N in the middle, and the three-cell battery holder at the back." width="100%"></td>
+  </tr>
+</table>
+
+The build in these photos:
+
+| Part | In the photos |
+|---|---|
+| Chassis | clear acrylic, four wheels, four yellow TT gear motors |
+| Computer | Raspberry Pi 4 Model B |
+| Camera | Camera Module v2 (imx219) on the white ribbon cable |
+| Motor driver | L298N, the red board, wired as in [Step 9](#step-9-wire-the-motors) |
+| Motor battery | three 18650 lithium cells in a holder, 11.1 V nominal |
+
+Keep the camera ribbon away from the wheels and fixed to the chassis: on this rover it
+worked loose while the motors were being wired, and the Pi stopped seeing the camera
+(see [Troubleshooting](#troubleshooting)).
+
+---
+
 ## Table of contents
 
+- [Download the app](#download-the-app)
 - [See the model detect fire](#see-the-model-detect-fire)
+- [Screenshots](#screenshots)
+- [The rover](#the-rover)
 - [What it does, end to end](#what-it-does-end-to-end)
 - [Architecture](#architecture)
 - [Measured performance](#measured-performance)
@@ -96,7 +251,6 @@ python live_test.py            # then open http://127.0.0.1:8777
 - [Troubleshooting](#troubleshooting)
 - [Change log](#change-log)
 - [What to do next](#what-to-do-next)
-- [Credits and licences](#credits-and-licences)
 
 ---
 
@@ -290,7 +444,10 @@ yours.
 │   ├── weights/                 Your weights and the NCNN export (not in git)
 │   └── README.md
 │
+├── release/                     agni-rover.apk, the installable Android app (Git LFS)
 ├── docs/media/                  The model demo video and its preview picture (Git LFS)
+├── docs/screenshots/            Screenshots of each app screen (Git LFS)
+├── docs/photos/                 Photos of the built rover (Git LFS)
 │
 ├── AGENTS.md                    Standing rules for anyone editing this repo
 └── README.md                    You are here
@@ -646,6 +803,9 @@ The app uses these native modules, all included in Expo Go: `react-native-webvie
 (video), `react-native-gesture-handler` (multi-touch controls), `expo-crypto` (secure
 random numbers for the handshake) and `expo-secure-store` (the token in the keystore).
 
+**A ready-built APK** is in the repo: see [Download the app](#download-the-app). Build
+your own only after changing the app.
+
 **As an installable APK**, to keep on the phone:
 
 ```bash
@@ -656,7 +816,9 @@ npx eas-cli build --platform android --profile preview
 
 It builds on Expo's servers in 10 to 20 minutes and gives you a download link. An APK
 contains the code it was built with, so **rebuild after any app change**. Your saved
-rover address and token survive reinstalling over the old version.
+rover address and token survive reinstalling over the old version. To publish a new
+build, replace `release/agni-rover.apk`, then update the version, date, size and
+SHA-256 in [Download the app](#download-the-app).
 
 The app allows plain `http://` and `ws://` traffic to the rover on Android
 (`usesCleartextTraffic` in `app.json`). Release builds block it by default, and without
@@ -793,6 +955,9 @@ The motors are off in software (`MOTOR_OUTPUT=0`) until you turn them on.
 | Stick fully left or right | one side forward, the other backward: a tank turn |
 | Hold the stick, tap **SPRINT** | wheels speed up; SPRINT stays lit until tapped again |
 | Hold **ACCEL** with the other thumb | forward drive while the stick steers |
+| **SPRINT** on, then tap **ACCEL** and let go | **CRUISE**: wheels keep spinning forward with no thumb on a control |
+| **BRAKE** during cruise | wheels stop sharply; CRUISE and SPRINT go out |
+| Hold **ACCEL + BRAKE** | wheels spin **backward**; the button reads REVERSE |
 | **BRAKE** while driving | wheels stop sharply |
 | Let go of everything | wheels stop within half a second |
 
@@ -920,9 +1085,9 @@ sudo systemctl restart agni-rover
   rover) and **LINK** (connected). A value with no hardware behind it shows `—`.
 - The **joystick** drives in any direction: push forward to go, to the side to turn on the
   spot, diagonally to curve. It springs back and stops the car when released.
-- **ACCEL** (hold) adds forward drive, so one thumb can steer while the other
-  accelerates. **SPRINT** (tap) latches a higher speed ceiling. **BRAKE** (tap) is a
-  hard stop and also releases SPRINT. All of them work while the stick is held.
+- **ACCEL**, **SPRINT** and **BRAKE** are pedals for the other thumb, and combine as in
+  [The drive buttons](#the-drive-buttons) below. Each tracks its own finger, so any of
+  them works while the stick, or another button, is held.
 - The **L/R bars** show what each side of the car is being told to do right now: green
   forward, red reverse, blue while sprinting. They use the same mix as the Pi.
 - The **AR** button switches the video between the rover's boxed stream and the plain
@@ -936,6 +1101,27 @@ sudo systemctl restart agni-rover
 - A **Fire Detected** or **Smoke Detected** warning shows the latest detection, how
   long ago it was seen, and a button to see it on the map.
 - Switching tabs or leaving the app while driving stops the car.
+
+### The drive buttons
+
+| Press | The car | Button shows |
+|---|---|---|
+| Hold **ACCEL** | drives forward while held | ACCEL lit |
+| Tap **SPRINT** | raises the speed ceiling from `MAX_DUTY` to `SPRINT_DUTY`; tap again to drop it | SPRINT ON |
+| **SPRINT** on, then **ACCEL** | **cruise**: drives forward at sprint speed, and **keeps going after you let go of ACCEL** | **CRUISE** |
+| Hold **ACCEL + BRAKE** together | **reverses** while both are held | **REVERSE** |
+| Let go of ACCEL while BRAKE is still held | ends the reverse in a hard stop | BRAKE |
+| Let go of BRAKE while ACCEL is still held | back to forward | ACCEL |
+| **BRAKE** alone | hard stop: both motors shorted for 0.5 s; also ends cruise and sprint | BRAKE |
+| The joystick, with any of the above | steers: cruise or reverse plus a sideways push curves the car | |
+
+The L and R bars under the label show the mode: **DRIVE**, **SPRINT**, **CRUISE** (blue)
+or **REVERSE** (red).
+
+**Cruise stops** on BRAKE, on turning SPRINT off, when the link drops, when you leave the
+Control screen or the app, and, as for any command, when the rover hears nothing for
+0.45 s. It is the one way the car keeps moving with no thumb on a control, so practise
+it on blocks first.
 
 **Map.** Drag to orbit, **+** and **−** to zoom, **TOP** for a top-down view, the
 crosshair to reset. The bin button clears the map; the Alerts tab keeps every detection.
@@ -1010,6 +1196,10 @@ that one connection.
 |---|---|---|
 | `drive` | `throttle`, `steering`, `sprint` | sets motor power and refreshes the watchdog; only from the device holding the controls |
 | `brake` | none | hard stop: both motors shorted for 0.5 s, then released; accepted from **any** connected device |
+
+Cruise and reverse need nothing new on the wire: the app sends them as ordinary `drive`
+commands (throttle `1` or `-1`), repeated like any held command, so the watchdog still
+stops the car if they stop arriving.
 | `ticket` | `purpose` (`stream` or `frame`) | asks for a ticket to open the video |
 | `device` | `device` (`flash` or `siren`), `enabled` | switches a GPIO output; telemetry confirms |
 | `settings` | `settings` object | sensitivity, auto-siren, location, camera quality, white balance |
@@ -1388,7 +1578,9 @@ same path the app does and names the first thing that broke.
 |---|---|
 | App cannot reach the rover | wrong address, rover not running, or client isolation on the Wi-Fi. Check with `systemctl status agni-rover` on the Pi and `python verify_rover.py --host <ip> --token <token>` |
 | Connected yesterday, not today | the Pi's address changed. Run `hostname -I` on the Pi, update Settings, and reserve the address on your router |
-| Installed APK cannot connect, Expo Go can | the APK predates the cleartext setting; rebuild it |
+| Installed APK cannot connect, Expo Go can | the APK predates the cleartext setting or the signed control link; install the current `release/agni-rover.apk` or rebuild it |
+| *App not installed* when updating the APK | the new APK is signed with a different key; uninstall the old app first |
+| Play Protect blocks the install | it is not from the Play Store. Check the SHA-256 in [Download the app](#download-the-app), then **Install anyway** |
 | `ssh: Permission denied` | wrong username or password, or the key was not installed; repeat [Step 5](#step-5-set-up-ssh-keys) |
 | `WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED` | you re-flashed the card. On your computer: `ssh-keygen -R agni-rover.local` |
 | "The rover rejected the access token" | the token in Settings does not match `ROVER_TOKEN` in `~/agni/rover.env`. The app stops retrying so it does not trigger the lockout |
@@ -1450,7 +1642,8 @@ Tape the ribbon to the chassis so it cannot flex near the wheels.
 |---|---|
 | **MOTORS OFF ON ROVER** shows | `MOTOR_OUTPUT=0`; see [Step 10](#step-10-enable-and-test-the-motors) |
 | Motors do nothing with output on | shared ground missing, ENA/ENB caps still on, battery off, or the rover was not restarted after the change |
-| SPRINT, BRAKE or ACCEL ignored while holding the stick | an old app version with single-touch controls; update the app and restart `npx expo start` |
+| SPRINT, BRAKE or ACCEL ignored while holding the stick or another button | an old app version with single-touch controls; update the app and restart `npx expo start --clear` |
+| The car keeps going forward on its own | cruise is on: the ACCEL button reads **CRUISE**. Tap BRAKE |
 | Turns on blocks, not on the floor | not enough torque to skid-turn; raise `MAX_DUTY` or turn with SPRINT |
 | One side runs backwards | `RIGHT_REVERSED=1`, or swap that motor's wires |
 | Car stutters while driving | drive commands are delayed; check `/status` responds in a few ms (the model must be in its own process) and the Wi-Fi signal |
@@ -1522,6 +1715,8 @@ checked. Measurements are from the Pi 4 described under
 | BRAKE only cut power, so the car coasted | hard brake: both motor inputs high for 0.5 s, then released | pin log: all four inputs high at 100 % for 0.5 s |
 | Switching tabs mid-drive kept the car driving | the Control screen stops the car when it goes away; so does leaving the app | code path |
 | Sprint had to be held with a third thumb | SPRINT latches on a tap | used on the phone |
+| ACCEL + SPRINT and ACCEL + BRAKE could not work: React Native's buttons share one touch responder, so a second button cancelled the first | ACCEL, SPRINT and BRAKE moved to native multi-touch gestures, like the stick | type-check and bundle |
+| No way to keep driving forward hands-free, or to reverse with the buttons | ACCEL with SPRINT on latches **cruise**; ACCEL + BRAKE held **reverses** | every pedal combination run through `domain/drive.ts`: forward, cruise, reverse and reverse-while-turning give the expected wheel commands |
 
 ### Deploy and setup
 
@@ -1531,6 +1726,7 @@ checked. Measurements are from the Pi 4 described under
 | An installed APK could not reach the rover | `usesCleartextTraffic` for plain `http`/`ws` on the local network | build config |
 | `python3-rpi.gpio` on current Raspberry Pi OS | documented: keep `python3-rpi-lgpio` | `GPIO ok` on the Pi |
 | Entering two URLs by hand | the app asks for the Pi's address and builds both | 13 inputs tested, valid and invalid |
+| No ready-made app to install | `release/agni-rover.apk`, version 1.0.0, with its SHA-256 in the README | the APK's bundled code checked for the handshake, signed messages, tickets, native video, drive pedals and keystore; cleartext allowed in its manifest |
 
 ---
 

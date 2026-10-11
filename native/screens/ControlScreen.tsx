@@ -1,6 +1,7 @@
 import { LinearGradient } from "expo-linear-gradient";
 import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import { Alert, Image, Pressable, StyleSheet, Text, View, useWindowDimensions, type LayoutChangeEvent, type StyleProp, type ViewStyle } from "react-native";
+import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import { Glass } from "../components/Glass";
 import { Joystick } from "../components/Joystick";
 import { LiveStream } from "../components/LiveStream";
@@ -13,7 +14,7 @@ import { useScreenInsets } from "../components/useOrientation";
 import { colors, font, radius } from "../theme";
 import type { AppTab, Detection, RobotTelemetry } from "../domain/robot";
 import { VALUE_UNAVAILABLE } from "../domain/robot";
-import { combinedThrottle, wheelMix } from "../domain/drive";
+import { combinedThrottle, driveMode, pedalThrottle, wheelMix, type DriveMode, type Pedals } from "../domain/drive";
 import { boxOnScreen, liveBoxWindowMs, liveDetections, relativeTime, type Size } from "../domain/detectionView";
 import { useRobot } from "../features/robot/RobotContext";
 
@@ -46,7 +47,6 @@ function DriveAction({
   active,
   disabled,
   label,
-  onPress,
   onPressIn,
   onPressOut,
   style,
@@ -57,35 +57,68 @@ function DriveAction({
   active?: boolean;
   disabled?: boolean;
   label: string;
-  onPress?: () => void;
   onPressIn?: () => void;
   onPressOut?: () => void;
   style: StyleProp<ViewStyle>;
   activeStyle: StyleProp<ViewStyle>;
   width: number;
 }) {
+  // A native gesture per button, like the stick. React Native's own buttons share
+  // one touch responder, so holding ACCEL and then pressing SPRINT or BRAKE
+  // cancelled ACCEL: the two-thumb combinations could never work.
+  const [pressed, setPressed] = useState(false);
+  const inRef = useRef(onPressIn);
+  inRef.current = onPressIn;
+  const outRef = useRef(onPressOut);
+  outRef.current = onPressOut;
+  const disabledRef = useRef(disabled);
+  disabledRef.current = disabled;
+  const downRef = useRef(false);
+
+  const gesture = useMemo(() => Gesture.Pan()
+    .minDistance(0)
+    .maxPointers(1)
+    .shouldCancelWhenOutside(false)
+    // Generous: these are hit by a thumb watching the video, not the button.
+    .hitSlop(8)
+    .runOnJS(true)
+    .onBegin(() => {
+      if (disabledRef.current) return;
+      downRef.current = true;
+      setPressed(true);
+      inRef.current?.();
+    })
+    .onFinalize(() => {
+      if (!downRef.current) return;
+      downRef.current = false;
+      setPressed(false);
+      outRef.current?.();
+    }), []);
+
   const iconColor = disabled ? colors.inkMuted : active ? "#081018" : colors.ink;
   return (
-    <Pressable
-      accessibilityRole="button"
-      accessibilityLabel={label}
-      accessibilityState={{ selected: active, disabled }}
-      disabled={disabled}
-      onPress={onPress}
-      onPressIn={onPressIn}
-      onPressOut={onPressOut}
-      // Generous slop: these are hit by a thumb that is watching the video, not the button.
-      hitSlop={8}
-      style={({ pressed }) => [
-        styles.driveAction, style, { width },
-        active && styles.driveActionActive, active && activeStyle,
-        pressed && !active && styles.pressed,
-        disabled && styles.dimmed,
-      ]}
-    >
-      <Icon size={20} color={iconColor} strokeWidth={1.8} />
-      <Text style={[styles.actionLabel, active && styles.actionLabelActive]}>{label}</Text>
-    </Pressable>
+    <GestureDetector gesture={gesture}>
+      <View
+        accessible
+        accessibilityRole="button"
+        accessibilityLabel={label}
+        accessibilityState={{ selected: active, disabled }}
+        onAccessibilityTap={() => {
+          if (disabled) return;
+          inRef.current?.();
+          outRef.current?.();
+        }}
+        style={[
+          styles.driveAction, style, { width },
+          active && styles.driveActionActive, active && activeStyle,
+          pressed && !active && styles.pressed,
+          disabled && styles.dimmed,
+        ]}
+      >
+        <Icon size={20} color={iconColor} strokeWidth={1.8} />
+        <Text style={[styles.actionLabel, active && styles.actionLabelActive]}>{label}</Text>
+      </View>
+    </GestureDetector>
   );
 }
 
@@ -231,7 +264,7 @@ function StatusPill({ telemetry, connected, compact }: { telemetry: RobotTelemet
   );
 }
 
-type DriveHudHandle = { show: (throttle: number, steering: number, sprint: boolean) => void };
+type DriveHudHandle = { show: (throttle: number, steering: number, mode: DriveMode) => void };
 
 /** Left and right wheel bars for the command being sent right now.
  *
@@ -240,19 +273,20 @@ type DriveHudHandle = { show: (throttle: number, steering: number, sprint: boole
  * through a handle so a drag re-renders only these bars, not the whole cockpit.
  */
 const DriveHud = forwardRef<DriveHudHandle, { height: number; disabled: boolean }>(function DriveHud({ height, disabled }, ref) {
-  const [state, setState] = useState({ left: 0, right: 0, sprint: false });
+  const [state, setState] = useState<{ left: number; right: number; mode: DriveMode }>({ left: 0, right: 0, mode: "DRIVE" });
   useImperativeHandle(ref, () => ({
-    show: (throttle, steering, sprint) => {
+    show: (throttle, steering, mode) => {
       const mix = wheelMix(throttle, steering);
       // Two decimals is finer than a bar can show; it skips renders for jitter.
       const left = Math.round(mix.left * 50) / 50;
       const right = Math.round(mix.right * 50) / 50;
-      setState(current => (current.left === left && current.right === right && current.sprint === sprint ? current : { left, right, sprint }));
+      setState(current => (current.left === left && current.right === right && current.mode === mode ? current : { left, right, mode }));
     },
   }), []);
+  const sprint = state.mode === "SPRINT" || state.mode === "CRUISE";
 
   const half = height / 2;
-  const forwardColor = state.sprint ? colors.cyan : colors.mint;
+  const forwardColor = sprint ? colors.cyan : colors.mint;
   const bar = (value: number, label: string) => (
     <View style={styles.hudColumn}>
       <View style={[styles.hudTrack, { height }]}>
@@ -268,17 +302,17 @@ const DriveHud = forwardRef<DriveHudHandle, { height: number; disabled: boolean 
     <Glass
       radius={16}
       style={[styles.hud, disabled && styles.dimmed]}
-      borderColor={state.sprint ? "rgba(76,201,240,0.55)" : undefined}
+      borderColor={state.mode === "REVERSE" ? "rgba(255,107,53,0.6)" : sprint ? "rgba(76,201,240,0.55)" : undefined}
     >
       <View
         accessible
-        accessibilityLabel={`Wheel command: left ${Math.round(state.left * 100)} percent, right ${Math.round(state.right * 100)} percent${state.sprint ? ", sprint" : ""}`}
+        accessibilityLabel={`Wheel command: left ${Math.round(state.left * 100)} percent, right ${Math.round(state.right * 100)} percent, ${state.mode.toLowerCase()}`}
         style={styles.hudBars}
       >
         {bar(state.left, "L")}
         {bar(state.right, "R")}
       </View>
-      <Text style={[styles.hudMode, { color: state.sprint ? colors.cyan : colors.inkMuted }]}>{state.sprint ? "SPRINT" : "DRIVE"}</Text>
+      <Text style={[styles.hudMode, { color: state.mode === "REVERSE" ? colors.fire1 : sprint ? colors.cyan : colors.inkMuted }]}>{state.mode}</Text>
     </Glass>
   );
 });
@@ -310,8 +344,8 @@ function AlertBanner({ alert, now, showLocation, onDismiss, onMap }: { alert: De
 }
 
 export default function ControlScreen({ landscape = false, onNavigate }: { landscape?: boolean; onNavigate: (tab: AppTab) => void }) {
-  const [sprint, setSprint] = useState(false);
-  const [accelerating, setAccelerating] = useState(false);
+  // What the buttons show; the refs below are what the drive command is built from.
+  const [pedalView, setPedalView] = useState<Pedals & { sprint: boolean }>({ accel: false, brake: false, cruise: false, sprint: false });
   const [dismissedId, setDismissedId] = useState<string | null>(null);
   const [now, setNow] = useState(Date.now());
   // The rover's frame is 16:9 at every quality setting; the stream reports the
@@ -344,18 +378,22 @@ export default function ControlScreen({ landscape = false, onNavigate }: { lands
     [detections, now, telemetry.inferenceMs],
   );
 
-  // The stick, the accelerator and sprint are three inputs to one drive command.
-  // Refs hold the live values so a press handler never sends a stale vector.
+  // The stick and the pedal buttons are inputs to one drive command. Refs hold the
+  // live values so a press handler never sends a stale vector.
   const stick = useRef({ throttle: 0, steering: 0 });
-  const accelRef = useRef(false);
+  const pedals = useRef<Pedals>({ accel: false, brake: false, cruise: false });
   const sprintRef = useRef(false);
   const hud = useRef<DriveHudHandle>(null);
 
+  const showPedals = useCallback(() => {
+    setPedalView({ ...pedals.current, sprint: sprintRef.current });
+  }, []);
+
   const pushDrive = useCallback(() => {
-    const throttle = combinedThrottle(stick.current.throttle, accelRef.current);
+    const throttle = combinedThrottle(stick.current.throttle, pedalThrottle(pedals.current));
     const steering = stick.current.steering;
     drive(throttle, steering, sprintRef.current);
-    hud.current?.show(throttle, steering, sprintRef.current);
+    hud.current?.show(throttle, steering, driveMode(pedals.current, sprintRef.current));
   }, [drive]);
 
   const onStickMove = useCallback((throttle: number, steering: number) => {
@@ -363,53 +401,88 @@ export default function ControlScreen({ landscape = false, onNavigate }: { lands
     pushDrive();
   }, [pushDrive]);
 
-  // Switching tabs unmounts the stick mid-gesture, and its release never fires.
-  // Without this the last command would keep being refreshed, and the car with it.
-  useEffect(() => () => {
+  const resetCockpit = useCallback(() => {
     stick.current = { throttle: 0, steering: 0 };
-    accelRef.current = false;
-    drive(0, 0, false);
-  }, [drive]);
-
-  // A dropped link resets the session's command; reset the cockpit to match, so
-  // reconnecting never resumes with ACCEL or SPRINT still lit.
-  useEffect(() => {
-    if (connected) return;
-    stick.current = { throttle: 0, steering: 0 };
-    accelRef.current = false;
+    pedals.current = { accel: false, brake: false, cruise: false };
     sprintRef.current = false;
-    setAccelerating(false);
-    setSprint(false);
-    hud.current?.show(0, 0, false);
-  }, [connected]);
-
-  const notConnectedNotice = useCallback(() => {
-    Alert.alert("Rover not connected", "Open Settings, enter the Raspberry Pi URLs and token, then connect to drive.");
   }, []);
 
-  const setAccelerate = (next: boolean) => {
-    accelRef.current = next;
-    setAccelerating(next);
+  // Switching tabs unmounts the stick and buttons mid-gesture, and their release
+  // never fires. Without this the last command, or a cruise, would keep being
+  // refreshed, and the car with it.
+  useEffect(() => () => {
+    resetCockpit();
+    drive(0, 0, false);
+  }, [drive, resetCockpit]);
+
+  // A dropped link resets the session's command; reset the cockpit to match, so
+  // reconnecting never resumes cruising or with a pedal still lit.
+  useEffect(() => {
+    if (connected) return;
+    resetCockpit();
+    showPedals();
+    hud.current?.show(0, 0, "DRIVE");
+  }, [connected, resetCockpit, showPedals]);
+
+  const notConnectedNotice = useCallback(() => {
+    Alert.alert("Rover not connected", "Open Settings, enter the Raspberry Pi address and token, then connect to drive.");
+  }, []);
+
+  /** The hard stop: zero everything and have the rover short the motors. */
+  const hardBrake = () => {
+    stick.current = { throttle: 0, steering: 0 };
+    pedals.current.cruise = false;
+    sprintRef.current = false;
+    showPedals();
+    brake();
+    hud.current?.show(0, 0, "DRIVE");
+  };
+
+  const onAccelIn = () => {
+    pedals.current.accel = true;
+    // ACCEL with SPRINT on latches cruise: the car keeps going forward when the
+    // thumb comes off, until BRAKE, SPRINT off or a lost link.
+    if (sprintRef.current && !pedals.current.brake) pedals.current.cruise = true;
+    showPedals();
     pushDrive();
+  };
+
+  const onAccelOut = () => {
+    pedals.current.accel = false;
+    showPedals();
+    // Letting go of ACCEL while still holding BRAKE ends a reverse in a stop.
+    if (pedals.current.brake) hardBrake();
+    else pushDrive();
   };
 
   // Sprint latches on a tap. Holding it needed a third thumb: one on the stick,
   // one on ACCEL, and none left for SPRINT.
-  const toggleSprint = () => {
-    const next = !sprintRef.current;
-    sprintRef.current = next;
-    setSprint(next);
+  const onSprintTap = () => {
+    sprintRef.current = !sprintRef.current;
+    if (!sprintRef.current) pedals.current.cruise = false;
+    else if (pedals.current.accel && !pedals.current.brake) pedals.current.cruise = true;
+    showPedals();
     pushDrive();
   };
 
-  const onBrake = () => {
-    stick.current = { throttle: 0, steering: 0 };
-    accelRef.current = false;
+  const onBrakeIn = () => {
+    pedals.current.brake = true;
+    pedals.current.cruise = false;
     sprintRef.current = false;
-    setAccelerating(false);
-    setSprint(false);
-    brake();
-    hud.current?.show(0, 0, false);
+    if (pedals.current.accel) {
+      // ACCEL and BRAKE together: reverse, for as long as both are held.
+      showPedals();
+      pushDrive();
+    } else {
+      hardBrake();
+    }
+  };
+
+  const onBrakeOut = () => {
+    pedals.current.brake = false;
+    showPedals();
+    // Still holding ACCEL: back to forward. Otherwise the brake is already done.
+    if (pedals.current.accel) pushDrive();
   };
 
   // Controls scale with the screen so the cockpit fits small phones and tablets.
@@ -532,30 +605,32 @@ export default function ControlScreen({ landscape = false, onNavigate }: { lands
           <View style={styles.actionStack}>
             <DriveAction
               Icon={AcceleratorIcon}
-              label="ACCEL"
-              active={accelerating}
+              label={pedalView.cruise ? "CRUISE" : "ACCEL"}
+              active={pedalView.accel || pedalView.cruise}
               disabled={!connected}
-              onPressIn={() => setAccelerate(true)}
-              onPressOut={() => setAccelerate(false)}
+              onPressIn={onAccelIn}
+              onPressOut={onAccelOut}
               style={styles.accelBtn}
               activeStyle={styles.accelBtnActive}
               width={actionWidth}
             />
             <DriveAction
               Icon={SprintIcon}
-              label={sprint ? "SPRINT ON" : "SPRINT"}
-              active={sprint}
+              label={pedalView.sprint ? "SPRINT ON" : "SPRINT"}
+              active={pedalView.sprint}
               disabled={!connected}
-              onPress={toggleSprint}
+              onPressIn={onSprintTap}
               style={styles.sprintBtn}
               activeStyle={styles.sprintBtnActive}
               width={actionWidth}
             />
             <DriveAction
               Icon={BrakeIcon}
-              label="BRAKE"
+              label={pedalView.brake && pedalView.accel ? "REVERSE" : "BRAKE"}
+              active={pedalView.brake}
               disabled={!connected}
-              onPress={onBrake}
+              onPressIn={onBrakeIn}
+              onPressOut={onBrakeOut}
               style={styles.brakeBtn}
               activeStyle={styles.brakeBtnActive}
               width={actionWidth}
