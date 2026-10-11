@@ -1188,17 +1188,3 @@ None of these exist yet. They are the honest gaps, in the order they would pay o
 | GPS | `gpsLocked` is honestly false: there is no module | telemetry, then `MapScreen` |
 
 ---
-
-## Credits and licences
-
-- Pretrained fire and smoke weights, and the training dataset, come from
-  [sayedgamal99/Real-Time-Smoke-Fire-Detection-YOLO11](https://github.com/sayedgamal99/Real-Time-Smoke-Fire-Detection-YOLO11)
-  and its [Roboflow dataset](https://universe.roboflow.com/sayed-gamall/fire-smoke-detection-yolov11).
-- The fallback pretrained model is
-  [TommyNgx/YOLOv10-Fire-and-Smoke-Detection](https://huggingface.co/TommyNgx/YOLOv10-Fire-and-Smoke-Detection),
-  Apache-2.0.
-- Detection and training use [Ultralytics](https://github.com/ultralytics/ultralytics),
-  which is AGPL-3.0. Check that licence before distributing a product built on it.
-
-Check each upstream licence before reusing the weights or the dataset. They are not
-covered by this repository's licence.
