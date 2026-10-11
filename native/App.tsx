@@ -10,6 +10,7 @@ import { useFonts } from "expo-font";
 import { StatusBar } from "expo-status-bar";
 import { useState, type ComponentType } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
+import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { Glass } from "./components/Glass";
 import { useLandscape } from "./components/useOrientation";
@@ -47,6 +48,7 @@ export default function App() {
   if (!fontsLoaded && !fontError) return <View style={styles.boot} />;
 
   return (
+    <GestureHandlerRootView style={styles.root}>
     <SafeAreaProvider>
       <RobotProvider>
         <StatusBar style="light" />
@@ -86,6 +88,7 @@ export default function App() {
         </View>
       </RobotProvider>
     </SafeAreaProvider>
+    </GestureHandlerRootView>
   );
 }
 

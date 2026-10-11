@@ -1,0 +1,43 @@
+# Runs the Agni rover service at boot, so the robot is reachable from the app
+# without anyone logging into the Pi.
+#
+# deploy.sh installs this for you. To do it by hand:
+#
+#   sudo cp agni-rover.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now agni-rover
+#   journalctl -u agni-rover -f
+#
+# The unit assumes the service lives in /home/pi/agni and runs as user pi.
+# Change WorkingDirectory, User and Group together if yours differ.
+
+[Unit]
+Description=Agni rover service (camera, fire detector, motors)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/agni
+EnvironmentFile=/home/pi/agni/rover.env
+ExecStart=/usr/bin/python3 /home/pi/agni/rover_server.py
+
+# The motors are physical. A crash must not leave the wheels energised, and the
+# service stopping must cut power rather than wait: rover_server.py stops the
+# motors on SIGINT, and the short timeout forces the issue if it hangs.
+KillSignal=SIGINT
+TimeoutStopSec=5
+Restart=on-failure
+RestartSec=3
+
+# Picamera2 and GPIO need the real devices, so this is deliberately not a
+# hardened sandbox. It does get its own /tmp.
+PrivateTmp=true
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

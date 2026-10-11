@@ -44,13 +44,6 @@ export const SmokeIcon = (p: IconProps) => (
   </Svg>
 );
 
-export const ShieldIcon = (p: IconProps) => (
-  <Svg {...useBase(p)}>
-    <Path d="M12 3 5 6v5c0 4 3 6.5 7 8 4-1.5 7-4 7-8V6l-7-3Z" />
-    <Path d="m9 12 2 2 4-4" />
-  </Svg>
-);
-
 export const SignalIcon = (p: IconProps) => (
   <Svg {...useBase(p)}>
     <Path d="M4 15v3M9 11v7M14 7v11M19 3v15" />
@@ -94,30 +87,10 @@ export const SirenIcon = (p: IconProps) => (
   </Svg>
 );
 
-export const SwitchCameraIcon = (p: IconProps) => (
-  <Svg {...useBase(p)}>
-    <Path d="M4 8h3l1.5-2h7L17 8h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1Z" />
-    <Path d="M9.5 13H15m0 0-1.8-1.8M15 13l-1.8 1.8" />
-  </Svg>
-);
-
 export const ArIcon = (p: IconProps) => (
   <Svg {...useBase(p)}>
     <Path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2" />
     <Circle cx="12" cy="12" r="2.6" />
-  </Svg>
-);
-
-export const CameraShutterIcon = (p: IconProps) => (
-  <Svg {...useBase(p)}>
-    <Path d="M4 8h3l1.5-2h7L17 8h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1Z" />
-    <Circle cx="12" cy="13" r="3.6" />
-  </Svg>
-);
-
-export const StopIcon = (p: IconProps) => (
-  <Svg {...useBase(p)}>
-    <Rect x="8" y="8" width="8" height="8" rx="2" />
   </Svg>
 );
 
@@ -147,12 +120,6 @@ export const BrakeIcon = (p: IconProps) => (
 export const ChevronIcon = (p: IconProps) => (
   <Svg {...useBase(p)}>
     <Path d="m9 6 6 6-6 6" />
-  </Svg>
-);
-
-export const ChevronUpIcon = (p: IconProps) => (
-  <Svg {...useBase(p)}>
-    <Path d="m6 15 6-6 6 6" />
   </Svg>
 );
 
@@ -189,9 +156,10 @@ export const CrosshairIcon = (p: IconProps) => (
   </Svg>
 );
 
-export const PlayIcon = (p: IconProps) => (
+export const ClearIcon = (p: IconProps) => (
   <Svg {...useBase(p)}>
-    <Path d="M8 5.5v13l11-6.5-11-6.5Z" />
+    <Path d="M4.5 7h15M10 7V5h4v2M6.5 7l1 12h9l1-12" />
+    <Path d="M10.5 11v5M13.5 11v5" />
   </Svg>
 );
 
@@ -225,15 +193,6 @@ export const CameraQualityIcon = (p: IconProps) => (
   </Svg>
 );
 
-export const PaletteIcon = (p: IconProps) => (
-  <Svg {...useBase(p)}>
-    <Path d="M12 3a9 9 0 1 0 0 18c1.4 0 2-1 2-2s-.6-1.5-.6-2.3c0-.9.7-1.7 1.7-1.7H18a3 3 0 0 0 3-3A9 9 0 0 0 12 3Z" />
-    <Circle cx="7.5" cy="11" r="1" fill={p.color ?? colors.ink} stroke="none" />
-    <Circle cx="12" cy="8" r="1" fill={p.color ?? colors.ink} stroke="none" />
-    <Circle cx="16" cy="11" r="1" fill={p.color ?? colors.ink} stroke="none" />
-  </Svg>
-);
-
 export const InfoIcon = (p: IconProps) => (
   <Svg {...useBase(p)}>
     <Circle cx="12" cy="12" r="8.5" />
@@ -244,14 +203,5 @@ export const InfoIcon = (p: IconProps) => (
 export const CloseIcon = (p: IconProps) => (
   <Svg {...useBase(p)}>
     <Path d="m7 7 10 10M17 7 7 17" />
-  </Svg>
-);
-
-export const CarIcon = (p: IconProps) => (
-  <Svg {...useBase(p)}>
-    <Path d="M4 15v-2l2-4.5A2 2 0 0 1 7.8 7h8.4a2 2 0 0 1 1.8 1.5L20 13v2" />
-    <Path d="M3 15h18v2a1 1 0 0 1-1 1h-1M5 18H4a1 1 0 0 1-1-1v-2" />
-    <Circle cx="7.5" cy="18" r="1.6" />
-    <Circle cx="16.5" cy="18" r="1.6" />
   </Svg>
 );

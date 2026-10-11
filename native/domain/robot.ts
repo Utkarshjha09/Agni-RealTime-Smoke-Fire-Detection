@@ -1,5 +1,4 @@
 export type DetectionKind = "fire" | "smoke";
-export type DriveDirection = "forward" | "backward" | "left" | "right" | "stop";
 export type AppTab = "control" | "map" | "alerts" | "settings";
 export type ConnectionState = "disconnected" | "connecting" | "connected" | "error";
 
@@ -61,9 +60,15 @@ export interface RobotTelemetry {
   signalDb: number;
   gpsLocked: boolean;
   roverName: string;
-  latitude: number;
-  longitude: number;
   inferenceMs: number;
+  /** False while MOTOR_OUTPUT=0: the rover accepts drive commands but the wheels stay still. */
+  motorOutput: boolean;
+  /** True when a pin is wired for the device; the app hides the button otherwise. */
+  flashAvailable: boolean;
+  /** The rover's own state, so an auto-siren starting or timing out is shown too. */
+  flashOn: boolean;
+  sirenAvailable: boolean;
+  sirenOn: boolean;
   /** True while the on-device fire/smoke model is running. */
   detectorActive: boolean;
   /** Why the model is not running, when it failed to start. */
@@ -72,6 +77,8 @@ export interface RobotTelemetry {
   suppressedDetections: number;
   /** Camera horizontal field of view in degrees, used to turn boxes into bearings. */
   cameraHfovDeg: number;
+  /** True when the camera takes white balance presets (the Pi camera; not a webcam). */
+  whiteBalanceAvailable: boolean;
   /** True when an ultrasonic sensor is wired and being read. */
   rangeSensorActive: boolean;
   /** Why the range sensor is not running, when it failed to start. */
@@ -93,12 +100,16 @@ export interface RobotEndpoints {
 
 export type CameraQuality = "480p" | "720p" | "1080p";
 
+/** Mirrors WHITE_BALANCE_MODES in raspberry_pi/rover_server.py. */
+export type WhiteBalance = "auto" | "daylight" | "cloudy" | "indoor" | "tungsten" | "fluorescent";
+
 export interface RobotSettings {
   detectionSensitivity: number;
   autoSiren: boolean;
   showAlerts: boolean;
   showLocation: boolean;
   cameraQuality: CameraQuality;
+  whiteBalance: WhiteBalance;
 }
 
 /** Appends the shared secret the Pi expects, preserving any existing query. */
@@ -114,4 +125,42 @@ export function isHttpUrl(url: string): boolean {
 
 export function isWebSocketUrl(url: string): boolean {
   return /^wss?:\/\/\S+$/i.test(url.trim());
+}
+
+/** The rover's continuous video for a camera frame URL, or "" when there is none.
+ *
+ * The rover serves /stream.mjpg beside /frame.jpg. A hand-entered camera URL that
+ * is not a /frame.jpg may be some other server, so it is polled as before.
+ */
+export function streamUrlFor(cameraUrl: string): string {
+  const url = cameraUrl.trim();
+  return /\/frame\.jpg$/i.test(url) ? url.replace(/\/frame\.jpg$/i, "/stream.mjpg") : "";
+}
+
+/** HTTP_PORT's default in raspberry_pi/rover_server.py. */
+export const DEFAULT_ROVER_PORT = 8000;
+
+/** "192.168.1.50", "192.168.1.50:8123" or "agni.local" -> the two URLs the rover serves.
+ *
+ * Both URLs carry the same host and port, so typing them separately on a phone
+ * keyboard was two chances to get one wrong. Null when it is not an address.
+ */
+export function endpointsFromAddress(address: string): { cameraUrl: string; websocketUrl: string } | null {
+  // Tolerate a pasted URL: drop any scheme and path, keep host and port.
+  const bare = address.trim().replace(/^[a-z]+:\/\//i, "").replace(/\/.*$/, "");
+  const match = /^([a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)(?::(\d{1,5}))?$/i.exec(bare);
+  if (!match) return null;
+  const port = Number(match[2] ?? DEFAULT_ROVER_PORT);
+  if (port < 1 || port > 65535) return null;
+  const hostPort = `${match[1]}:${port}`;
+  return { cameraUrl: `http://${hostPort}/frame.jpg`, websocketUrl: `ws://${hostPort}/control` };
+}
+
+/** The address two URLs were built from, or "" when they were customised by hand. */
+export function addressFromEndpoints(cameraUrl: string, websocketUrl: string): string {
+  const match = /^ws:\/\/([^/:]+):(\d+)\/control$/i.exec(websocketUrl.trim());
+  if (!match) return "";
+  const address = Number(match[2]) === DEFAULT_ROVER_PORT ? match[1] : `${match[1]}:${match[2]}`;
+  const derived = endpointsFromAddress(address);
+  return derived && derived.cameraUrl === cameraUrl.trim() ? address : "";
 }

@@ -5,9 +5,10 @@ import { AppGround } from "../components/AppGround";
 import { Glass } from "../components/Glass";
 import { AgniMark, BellIcon, CameraQualityIcon, ChevronIcon, FlameIcon, GaugeIcon, GpsIcon, InfoIcon, SirenIcon, WifiIcon } from "../components/icons";
 import { colors, font, radius } from "../theme";
-import type { AppTab, CameraQuality } from "../domain/robot";
-import { isHttpUrl, isWebSocketUrl } from "../domain/robot";
+import type { AppTab, CameraQuality, WhiteBalance } from "../domain/robot";
+import { addressFromEndpoints, endpointsFromAddress, isHttpUrl, isWebSocketUrl } from "../domain/robot";
 import { useRobot } from "../features/robot/RobotContext";
+import { useScreenInsets } from "../components/useOrientation";
 
 function Toggle({ on, onChange, label }: { on: boolean; onChange: (value: boolean) => void; label: string }) {
   return (
@@ -29,30 +30,72 @@ function SettingsRow({ Icon, label, children }: { Icon: typeof BellIcon; label: 
 
 export default function SettingsScreen({ landscape = false }: { landscape?: boolean; onNavigate?: (tab: AppTab) => void }) {
   const { connect, connectionMessage, connectionState, disconnect, endpoints, settings, telemetry, updateSettings } = useRobot();
+  const insets = useScreenInsets(landscape);
   const [cameraUrl, setCameraUrl] = useState(endpoints.cameraUrl);
   const [websocketUrl, setWebsocketUrl] = useState(endpoints.websocketUrl);
   const [token, setToken] = useState(endpoints.token);
+  const [address, setAddress] = useState(addressFromEndpoints(endpoints.cameraUrl, endpoints.websocketUrl));
+  // Saved URLs that no address could have produced (a custom path, wss://) open
+  // the full URL fields, so a working setup is never hidden behind a blank address.
+  const [showUrls, setShowUrls] = useState(
+    Boolean(endpoints.websocketUrl) && !addressFromEndpoints(endpoints.cameraUrl, endpoints.websocketUrl),
+  );
   const [urlError, setUrlError] = useState("");
   const [qualityPicker, setQualityPicker] = useState(false);
+  const [balancePicker, setBalancePicker] = useState(false);
   const [aboutOpen, setAboutOpen] = useState(false);
   // Local value keeps the slider smooth; only the released value hits the rover.
   const [sensitivity, setSensitivity] = useState(settings.detectionSensitivity);
   const connected = connectionState === "connected";
   const connecting = connectionState === "connecting";
   const qualities: CameraQuality[] = ["480p", "720p", "1080p"];
+  const balances: { mode: WhiteBalance; label: string; meta: string }[] = [
+    { mode: "daylight", label: "Daylight", meta: "Natural colours in daylight and most rooms" },
+    { mode: "auto", label: "Auto", meta: "The camera guesses; can tint under mixed light" },
+    { mode: "cloudy", label: "Cloudy", meta: "Warmer, for overcast or shade" },
+    { mode: "indoor", label: "Indoor", meta: "Typical indoor lighting" },
+    { mode: "fluorescent", label: "Fluorescent", meta: "Tube lights" },
+    { mode: "tungsten", label: "Tungsten", meta: "Warm yellow bulbs" },
+  ];
+  const balanceLabel = balances.find(option => option.mode === settings.whiteBalance)?.label ?? settings.whiteBalance;
 
   // Reflect endpoints restored from storage, or edited elsewhere.
   useEffect(() => {
     setCameraUrl(endpoints.cameraUrl);
     setWebsocketUrl(endpoints.websocketUrl);
     setToken(endpoints.token);
+    setAddress(addressFromEndpoints(endpoints.cameraUrl, endpoints.websocketUrl));
   }, [endpoints.cameraUrl, endpoints.token, endpoints.websocketUrl]);
+
+  const onAddressChange = (value: string) => {
+    setAddress(value);
+    const derived = endpointsFromAddress(value);
+    if (derived) {
+      setCameraUrl(derived.cameraUrl);
+      setWebsocketUrl(derived.websocketUrl);
+    }
+    setUrlError("");
+  };
+
+  // Editing a URL by hand keeps the address field honest about what it shows.
+  const onCameraUrlChange = (value: string) => {
+    setCameraUrl(value);
+    setAddress(addressFromEndpoints(value, websocketUrl));
+  };
+  const onWebsocketUrlChange = (value: string) => {
+    setWebsocketUrl(value);
+    setAddress(addressFromEndpoints(cameraUrl, value));
+  };
 
   useEffect(() => setSensitivity(settings.detectionSensitivity), [settings.detectionSensitivity]);
 
   const handleConnect = () => {
     const nextCamera = cameraUrl.trim();
     const nextSocket = websocketUrl.trim();
+    if (!showUrls && !endpointsFromAddress(address)) {
+      setUrlError(address.trim() ? "That is not an address. Use the Pi's IP, like 192.168.1.50" : "Enter the Pi's IP address first.");
+      return;
+    }
     if (!isWebSocketUrl(nextSocket)) {
       setUrlError("Control URL must start with ws:// or wss://");
       return;
@@ -67,7 +110,7 @@ export default function SettingsScreen({ landscape = false }: { landscape?: bool
 
   return (
     <AppGround>
-      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingTop: 44, paddingBottom: landscape ? 24 : 96, paddingLeft: landscape ? 76 : 16, paddingRight: 16 }}>
+      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingTop: insets.top, paddingBottom: insets.bottom + 8, paddingLeft: insets.left, paddingRight: insets.right }}>
         <Text style={styles.h1}>Settings</Text>
         <Text style={styles.sub}>{connected ? `${telemetry.roverName} · field controller` : "Rover not connected"}</Text>
 
@@ -81,10 +124,21 @@ export default function SettingsScreen({ landscape = false }: { landscape?: bool
             </View>
           </View>
 
-          <Text style={styles.fieldLabel}>CAMERA FRAME URL</Text>
-          <TextInput accessibilityLabel="Camera frame URL" value={cameraUrl} onChangeText={setCameraUrl} autoCapitalize="none" autoCorrect={false} keyboardType="url" placeholder="http://192.168.1.50:8000/frame.jpg" placeholderTextColor={colors.inkMuted} style={styles.input} />
-          <Text style={styles.fieldLabel}>CONTROL WEBSOCKET URL</Text>
-          <TextInput accessibilityLabel="Control WebSocket URL" value={websocketUrl} onChangeText={setWebsocketUrl} autoCapitalize="none" autoCorrect={false} keyboardType="url" placeholder="ws://192.168.1.50:8000/control" placeholderTextColor={colors.inkMuted} style={styles.input} />
+          <Text style={styles.fieldLabel}>PI ADDRESS</Text>
+          <TextInput accessibilityLabel="Raspberry Pi address" value={address} onChangeText={onAddressChange} autoCapitalize="none" autoCorrect={false} keyboardType="url" placeholder="192.168.1.50" placeholderTextColor={colors.inkMuted} style={styles.input} />
+          <Text style={styles.fieldHint}>Run "hostname -I" on the Pi to find it. Port 8000 is assumed; add :port if you changed HTTP_PORT.</Text>
+          <Pressable accessibilityRole="button" accessibilityState={{ expanded: showUrls }} onPress={() => setShowUrls(open => !open)} hitSlop={8} style={styles.urlToggle}>
+            <Text style={styles.urlToggleText}>{showUrls ? "Hide full URLs" : "Show full URLs"}</Text>
+            <View style={{ transform: [{ rotate: showUrls ? "-90deg" : "90deg" }] }}><ChevronIcon size={14} color={colors.cyan} /></View>
+          </Pressable>
+          {showUrls && (
+            <>
+              <Text style={styles.fieldLabel}>CAMERA FRAME URL</Text>
+              <TextInput accessibilityLabel="Camera frame URL" value={cameraUrl} onChangeText={onCameraUrlChange} autoCapitalize="none" autoCorrect={false} keyboardType="url" placeholder="http://192.168.1.50:8000/frame.jpg" placeholderTextColor={colors.inkMuted} style={styles.input} />
+              <Text style={styles.fieldLabel}>CONTROL WEBSOCKET URL</Text>
+              <TextInput accessibilityLabel="Control WebSocket URL" value={websocketUrl} onChangeText={onWebsocketUrlChange} autoCapitalize="none" autoCorrect={false} keyboardType="url" placeholder="ws://192.168.1.50:8000/control" placeholderTextColor={colors.inkMuted} style={styles.input} />
+            </>
+          )}
           <Text style={styles.fieldLabel}>ACCESS TOKEN (ROVER_TOKEN)</Text>
           <TextInput accessibilityLabel="Rover access token" value={token} onChangeText={setToken} autoCapitalize="none" autoCorrect={false} secureTextEntry placeholder="Leave empty if the rover has no token" placeholderTextColor={colors.inkMuted} style={styles.input} />
           {urlError ? <Text style={styles.errorText}>{urlError}</Text> : null}
@@ -160,6 +214,15 @@ export default function SettingsScreen({ landscape = false }: { landscape?: bool
           <Pressable accessibilityRole="button" accessibilityLabel="Change camera quality" onPress={() => setQualityPicker(true)}>
             <SettingsRow Icon={CameraQualityIcon} label="Camera quality"><View style={styles.valueRow}><Text style={styles.value}>{settings.cameraQuality}</Text><ChevronIcon size={16} color={colors.inkMuted} /></View></SettingsRow>
           </Pressable>
+          {/* Only a camera that takes presets gets the row; a webcam would ignore it. */}
+          {telemetry.whiteBalanceAvailable && (
+            <>
+              <View style={styles.separator} />
+              <Pressable accessibilityRole="button" accessibilityLabel="Change camera colour" onPress={() => setBalancePicker(true)}>
+                <SettingsRow Icon={CameraQualityIcon} label="Camera colour"><View style={styles.valueRow}><Text style={styles.value}>{balanceLabel}</Text><ChevronIcon size={16} color={colors.inkMuted} /></View></SettingsRow>
+              </Pressable>
+            </>
+          )}
         </Glass>
 
         <Text style={styles.groupTitle}>ABOUT</Text>
@@ -172,6 +235,27 @@ export default function SettingsScreen({ landscape = false }: { landscape?: bool
 
       <Modal visible={qualityPicker} transparent animationType="fade" onRequestClose={() => setQualityPicker(false)}>
         <View style={styles.modalBackdrop}><Pressable style={StyleSheet.absoluteFill} onPress={() => setQualityPicker(false)} /><Glass dim intensity={80} radius={radius.panel} style={styles.modalCard}><Text style={styles.modalTitle}>Camera quality</Text>{qualities.map(quality => <Pressable key={quality} accessibilityRole="button" onPress={() => { updateSettings({ cameraQuality: quality }); setQualityPicker(false); }} style={[styles.option, settings.cameraQuality === quality && styles.optionActive]}><Text style={styles.optionText}>{quality}</Text><Text style={styles.optionMeta}>{quality === "480p" ? "Lower bandwidth" : quality === "720p" ? "Balanced" : "Highest detail"}</Text></Pressable>)}</Glass></View>
+      </Modal>
+
+      <Modal visible={balancePicker} transparent animationType="fade" onRequestClose={() => setBalancePicker(false)}>
+        <View style={styles.modalBackdrop}>
+          <Pressable style={StyleSheet.absoluteFill} onPress={() => setBalancePicker(false)} />
+          <Glass dim intensity={80} radius={radius.panel} style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Camera colour</Text>
+            {balances.map(option => (
+              <Pressable
+                key={option.mode}
+                accessibilityRole="button"
+                accessibilityState={{ selected: settings.whiteBalance === option.mode }}
+                onPress={() => { updateSettings({ whiteBalance: option.mode }); setBalancePicker(false); }}
+                style={[styles.option, settings.whiteBalance === option.mode && styles.optionActive]}
+              >
+                <Text style={styles.optionText}>{option.label}</Text>
+                <Text style={styles.optionMeta}>{option.meta}</Text>
+              </Pressable>
+            ))}
+          </Glass>
+        </View>
       </Modal>
 
       <Modal visible={aboutOpen} transparent animationType="fade" onRequestClose={() => setAboutOpen(false)}>
@@ -192,6 +276,9 @@ const styles = StyleSheet.create({
   connectionMessage: { color: colors.inkMuted, fontFamily: font.sans, fontSize: 12, marginTop: 2 },
   fieldLabel: { color: colors.inkMuted, fontFamily: font.monoBold, fontSize: 10, letterSpacing: 1, marginBottom: 6 },
   input: { color: colors.ink, fontFamily: font.mono, fontSize: 12, borderWidth: 1, borderColor: "rgba(255,255,255,0.14)", backgroundColor: "rgba(0,0,0,0.16)", borderRadius: 10, paddingHorizontal: 12, paddingVertical: 10, marginBottom: 12 },
+  fieldHint: { color: colors.inkMuted, fontFamily: font.sans, fontSize: 11, lineHeight: 16, marginTop: -6, marginBottom: 10 },
+  urlToggle: { flexDirection: "row", alignItems: "center", gap: 6, alignSelf: "flex-start", marginBottom: 12 },
+  urlToggleText: { color: colors.cyan, fontFamily: font.sansBold, fontSize: 12 },
   errorText: { color: colors.fire1, fontFamily: font.sans, fontSize: 12, marginBottom: 10 },
   errorRow: { paddingHorizontal: 16, paddingVertical: 12 },
   connectBtn: { backgroundColor: colors.cyan, borderRadius: 12, alignItems: "center", paddingVertical: 12, marginTop: 2 },

@@ -6,3 +6,8 @@ opencv-python-headless>=4.8,<5
 # ultralytics pulls in PyTorch, which is a large install on a Raspberry Pi.
 ultralytics>=8.3
 huggingface_hub>=0.24
+
+# Needed only to run an NCNN export (the format model/export.py produces by
+# default, and several times faster than a .pt on the Pi's ARM CPU).
+# Harmless elsewhere; ultralytics imports it only for a .../*_ncnn_model path.
+ncnn>=1.0.20240410

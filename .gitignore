@@ -105,3 +105,7 @@ tmp/
 Thumbs.db
 ehthumbs.db
 desktop.ini
+
+# The rover's environment file holds the shared secret the app drives with.
+raspberry_pi/rover.env
+!raspberry_pi/rover.env.example

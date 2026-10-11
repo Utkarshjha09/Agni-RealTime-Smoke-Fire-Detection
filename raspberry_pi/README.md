@@ -8,18 +8,71 @@ It exposes:
 
 | Endpoint | Purpose | Auth |
 |---|---|---|
+| `GET /stream.mjpg` | continuous MJPEG video at `STREAM_FPS`; what the app shows | token |
 | `GET /frame.jpg` | one JPEG frame from the camera | token |
 | `GET /control` | WebSocket: drive, brake, devices, settings, telemetry, detections, range | token |
 | `POST /detections` | publish a detection from an external detector | token |
 | `GET /status` | liveness probe (no camera content, no control) | open |
 
-## Install on the Pi
+## Deploy in one command
+
+From your computer, with the Pi on the network and SSH enabled:
+
+```bash
+./deploy.sh pi@192.168.1.50
+```
+
+That copies this service and the exported model to the Pi, installs the
+dependencies, generates a token, installs a systemd unit so the rover comes up at
+boot, checks the service answers, and prints the three values to type into the
+app. Re-running is safe: an existing `rover.env` is never overwritten, so your
+token and motor settings survive later deploys.
+
+```bash
+./deploy.sh pi@192.168.1.50 --model ../model/runs/agni-fire-smoke/weights/best_ncnn_model
+./deploy.sh pi@192.168.1.50 --no-deps     # code only, after the first deploy
+./deploy.sh pi@192.168.1.50 --no-model    # let the Pi download pretrained weights
+./deploy.sh --help
+```
+
+Settings live in `rover.env` on the Pi, from `rover.env.example`. After editing it:
+
+```bash
+ssh pi@192.168.1.50 "sudo systemctl restart agni-rover"
+ssh pi@192.168.1.50 "journalctl -u agni-rover -f"
+```
+
+## Check it works
+
+`verify_rover.py` walks the same path the app does and names the first thing that
+broke. It is the quickest answer to "is it the app or the rover?".
+
+```bash
+python verify_rover.py --host 192.168.1.50 --token yourtoken
+python verify_rover.py --host 192.168.1.50 --token yourtoken --drive
+```
+
+Without `--drive` it sends no motion, so it is safe against a rover with live
+motors. With `--drive` it sends one brief command and confirms the watchdog cuts
+power afterwards; put the chassis on blocks first. It exits non-zero if any check
+failed.
+
+## Install on the Pi by hand
+
+`deploy.sh` is a convenience, not a requirement. To do it yourself:
 
 ```bash
 sudo apt update
 sudo apt install -y python3-picamera2 python3-opencv python3-pip
-python3 -m pip install -r requirements.txt --break-system-packages
+# CPU-only PyTorch first: the default wheel adds ~4 GB of NVIDIA CUDA
+# libraries that a Pi cannot use.
+python3 -m pip install --break-system-packages --no-cache-dir \
+  --index-url https://download.pytorch.org/whl/cpu torch torchvision
+python3 -m pip install --break-system-packages --no-cache-dir -r requirements.txt
 ```
+
+Then copy `rover.env.example` to `rover.env`, fill it in, and follow the comments
+at the top of `agni-rover.service` to install the unit.
 
 `ultralytics` (and the PyTorch it pulls in) is only needed if you run the
 on-device model. Skip those two lines of `requirements.txt` for a camera-and-motors-only
@@ -42,20 +95,28 @@ isolated bench network.
 ## Connect the app
 
 The phone and Pi must be on the same Wi-Fi network. In the app's **Settings**,
-enter these using the Pi's LAN address:
+enter two values:
 
 ```text
-Camera frame URL:       http://192.168.1.50:8000/frame.jpg
-Control WebSocket URL:  ws://192.168.1.50:8000/control
-Access token:           the ROVER_TOKEN value
+Pi address:     192.168.1.50          (from hostname -I on the Pi)
+Access token:   the ROVER_TOKEN value
 ```
 
+The app builds `http://<address>:8000/frame.jpg` and `ws://<address>:8000/control`
+from the address, and shows the live video from `/stream.mjpg` beside them. Add
+`:port` if you changed `HTTP_PORT`; **Show full URLs** reveals both for editing.
 The app stores these, reconnects automatically, and restores them next launch.
 
 ## Fire and smoke detection on the rover
 
-`fire_detector.py` runs the model **inside this service**, because Picamera2
-cannot be opened by two processes at once. Enable it with:
+The server owns the camera, because Picamera2 cannot be opened by two processes,
+and runs `fire_detector.py` in a **separate process** it starts and supervises.
+The NCNN inference library holds Python's interpreter lock for its whole pass, so
+in the server's own process it froze the video and the drive commands for about
+0.4 s of every 0.5 s. In its own process, with `DETECT_THREADS` threads at a lower
+CPU priority, the server answers in milliseconds whatever the model is doing. If
+the detector process dies, the server reports it and starts a new one. Enable it
+with:
 
 ```bash
 DETECTOR=1 ROVER_TOKEN=yourtoken python3 rover_server.py
@@ -74,16 +135,18 @@ app, which draws them over the live camera and places them on the map.
 | Variable | Default | Effect |
 |---|---|---|
 | `DETECT_INTERVAL` | `0.8` | seconds between inference passes |
+| `DETECT_THREADS` | `2` | CPU threads for the model; leaves cores for camera and video |
 | `DETECT_IMGSZ` | `320` | input size; `416`/`640` are slower but more accurate |
 | `DETECT_CONF` | `0.25` | model confidence floor |
 | `DETECT_TRACK_TTL` | `3.0` | seconds a box stays after it was last seen |
 | `MODEL_PATH` | — | use a local `.pt` instead of downloading |
 | `CAMERA_HFOV` | `62.2` | camera horizontal field of view, degrees (see below) |
 
-The defaults target a **Raspberry Pi 4**: roughly 1-2 inferences per second at
-`imgsz=320`. On a Pi 5 try `DETECT_IMGSZ=416 DETECT_INTERVAL=0.5`. The camera feed
-itself is unaffected — detection runs beside it, so driving stays responsive even
-when inference is slow.
+Measured on a Raspberry Pi 4 with the repo's YOLO11n NCNN export at 640 px: about
+800 ms per pass with the app's video stream running, about 490 ms without, while
+the stream holds about 14 fps. Three threads were no faster than two and slowed
+the stream. On a Pi 5, try `DETECT_INTERVAL=0.5`. The video and the drive commands
+are unaffected by a slow pass, because the model runs in its own process.
 
 ### Camera field of view (needed by the 3D view)
 
@@ -227,11 +290,18 @@ The default mapping is left motor `IN1=17`, `IN2=27`, `PWM=12`; right motor
 the wrong direction. The service stops both motors when the last app disconnects
 or when no movement packet arrives for 0.45 seconds.
 
-Flashlight and siren need their optional BCM pins set before starting:
+Flashlight and siren need their optional BCM pins set before starting. They work
+whether or not `MOTOR_OUTPUT` is on, so you can bench-test them with the wheels
+disabled:
 
 ```bash
-MOTOR_OUTPUT=1 FLASH_PIN=24 SIREN_PIN=25 DETECTOR=1 python3 rover_server.py
+FLASH_PIN=24 SIREN_PIN=25 DETECTOR=1 python3 rover_server.py
 ```
+
+The app shows a button only for a device whose pin is set, and lights it from the
+rover's reported state (`flashOn`, `sirenOn` in telemetry), not from the last tap.
+Switch the load through a transistor or relay; a GPIO pin cannot drive a lamp or
+siren directly.
 
 An auto-siren triggered by a fire detection holds for `SIREN_HOLD` seconds
 (default 5) and each new fire extends that hold rather than cutting it short.

@@ -1,6 +1,6 @@
 import { LinearGradient } from "expo-linear-gradient";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Image, Modal, PanResponder, Pressable, StyleSheet, Text, View, type LayoutChangeEvent } from "react-native";
+import { Image, Modal, PanResponder, Pressable, StyleSheet, Text, View, useWindowDimensions, type LayoutChangeEvent } from "react-native";
 import Svg, { Circle, Ellipse, G, Line, Polygon, Text as SvgText } from "react-native-svg";
 import { AppGround } from "../components/AppGround";
 import { Glass } from "../components/Glass";
@@ -13,9 +13,10 @@ import {
   MAX_PITCH, clampCamera, defaultCamera, project, projectSegment, viewBasis,
   type OrbitCamera,
 } from "../domain/scene3d";
-import { CloseIcon, CrosshairIcon, LayersIcon, MinusIcon, PlusIcon } from "../components/icons";
+import { ClearIcon, CloseIcon, CrosshairIcon, LayersIcon, MinusIcon, PlusIcon } from "../components/icons";
 import { colors, font, radius } from "../theme";
 import { useRobot } from "../features/robot/RobotContext";
+import { useScreenInsets } from "../components/useOrientation";
 
 /** Ground grid: 1m cells out to this many metres. */
 const GRID_EXTENT = 12;
@@ -24,7 +25,21 @@ const GRID_STEP = 2;
 const FADE_AFTER_MS = 120000;
 
 export default function MapScreen({ landscape = false, onNavigate }: { landscape?: boolean; onNavigate?: (tab: AppTab) => void }) {
-  const { connectionState, detections, rangeReadings, telemetry } = useRobot();
+  const { clearMap, connectionState, detections: allDetections, mapClearedAt, rangeReadings: allReadings, telemetry } = useRobot();
+  // Clearing hides what was on the map; the Alerts tab still has every detection.
+  const detections = useMemo(
+    () => allDetections.filter(detection => (detection.receivedAt ?? 0) > mapClearedAt),
+    [allDetections, mapClearedAt],
+  );
+  const rangeReadings = useMemo(
+    () => allReadings.filter(reading => (reading.receivedAt ?? 0) > mapClearedAt),
+    [allReadings, mapClearedAt],
+  );
+  const insets = useScreenInsets(landscape);
+  const { width: screenWidth } = useWindowDimensions();
+  // Legend and summary side by side need ~420pt. Narrower, the legend moves to
+  // the top-left corner so the two cards never overlap.
+  const legendOnTop = !landscape && screenWidth < 440;
   const [camera, setCamera] = useState<OrbitCamera>(defaultCamera);
   const [viewport, setViewport] = useState({ width: 0, height: 0 });
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -79,6 +94,7 @@ export default function MapScreen({ landscape = false, onNavigate }: { landscape
   const rangePoints = useMemo(() => placeRangeReadings(rangeReadings, now), [now, rangeReadings]);
   const lastPing = useMemo(() => latestReading(rangeReadings), [rangeReadings]);
   const rangeActive = telemetry.rangeSensorActive;
+  const mapHasContent = placements.length > 0 || rangePoints.length > 0;
 
   // "No echo" is not "0 m". Nothing answered within the sensor's range, which on a
   // fire robot must never be shown as an obstacle pressed against the bumper.
@@ -233,7 +249,7 @@ export default function MapScreen({ landscape = false, onNavigate }: { landscape
       <LinearGradient colors={["rgba(0,0,0,0.35)", "transparent", "rgba(0,0,0,0.5)"]} style={StyleSheet.absoluteFill} pointerEvents="none" />
 
       {/* Title */}
-      <View style={styles.titleWrap} pointerEvents="box-none">
+      <View style={[styles.titleWrap, { top: insets.top }]} pointerEvents="box-none">
         <Glass radius={999} style={styles.titlePill}>
           <LiveDot color={placements.length > 0 ? colors.fire1 : colors.inkMuted} />
           <Text style={styles.titleText}>Area View</Text>
@@ -242,7 +258,7 @@ export default function MapScreen({ landscape = false, onNavigate }: { landscape
       </View>
 
       {/* Control cluster */}
-      <View style={styles.cluster} pointerEvents="box-none">
+      <View style={[styles.cluster, { top: insets.top + 52, right: insets.right }]} pointerEvents="box-none">
         <Pressable accessibilityRole="button" accessibilityLabel="Top-down view" onPress={topDown}>
           <Glass radius={18} style={styles.clusterBtn}><Text style={{ color: colors.cyan, fontFamily: font.monoBold, fontSize: 11 }}>TOP</Text></Glass>
         </Pressable>
@@ -254,10 +270,19 @@ export default function MapScreen({ landscape = false, onNavigate }: { landscape
         <Pressable accessibilityRole="button" accessibilityLabel="Reset view" onPress={resetView}>
           <Glass radius={18} style={styles.clusterBtn}><CrosshairIcon size={20} color={colors.cyan} /></Glass>
         </Pressable>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Clear the map"
+          accessibilityState={{ disabled: !mapHasContent }}
+          disabled={!mapHasContent}
+          onPress={() => { setSelectedId(null); clearMap(); }}
+        >
+          <Glass radius={18} style={[styles.clusterBtn, !mapHasContent && styles.clusterBtnDisabled]}><ClearIcon size={20} color={mapHasContent ? colors.fire1 : colors.inkMuted} /></Glass>
+        </Pressable>
       </View>
 
       {/* Legend */}
-      <Glass radius={20} style={[styles.legend, { left: landscape ? 76 : 16, bottom: landscape ? 16 : 96 }]}>
+      <Glass radius={20} style={[styles.legend, legendOnTop ? { left: insets.left, top: insets.top + 52 } : { left: insets.left, bottom: insets.bottom }]}>
         <View style={styles.legendHead}><LayersIcon size={16} color={colors.inkMuted} /><Text style={styles.legendHeadText}>LEGEND</Text></View>
         {[
           [colors.fire1, "Fire"],
@@ -275,7 +300,7 @@ export default function MapScreen({ landscape = false, onNavigate }: { landscape
       </Glass>
 
       {/* Status / empty state */}
-      <View style={[styles.summaryWrap, { bottom: landscape ? 16 : 96, right: 16 }]} pointerEvents="box-none">
+      <View style={[styles.summaryWrap, { bottom: insets.bottom, right: insets.right }]} pointerEvents="box-none">
         <Glass radius={20} style={styles.summary}>
           {rangeActive && (
             <View style={styles.clearanceBlock}>
@@ -314,9 +339,11 @@ export default function MapScreen({ landscape = false, onNavigate }: { landscape
                 </Text>
                 <Pressable accessibilityLabel="Close" onPress={() => setSelectedId(null)} hitSlop={10}><CloseIcon size={16} color={colors.inkMuted} /></Pressable>
               </View>
-              <View style={styles.popThumb}>
-                {selected.detection.snapshotUrl ? <Image source={{ uri: selected.detection.snapshotUrl }} style={StyleSheet.absoluteFill} resizeMode="cover" /> : null}
-              </View>
+              {selected.detection.snapshotUrl ? (
+                <View style={styles.popThumb}>
+                  <Image source={{ uri: selected.detection.snapshotUrl }} style={StyleSheet.absoluteFill} resizeMode="cover" />
+                </View>
+              ) : null}
               {[
                 ["Confidence", `${selected.detection.confidence}%`],
                 ["Bearing", `${selected.bearingDeg >= 0 ? "+" : ""}${selected.bearingDeg.toFixed(1)}° from centre`],
@@ -350,12 +377,13 @@ export default function MapScreen({ landscape = false, onNavigate }: { landscape
 }
 
 const styles = StyleSheet.create({
-  titleWrap: { position: "absolute", top: 44, left: 0, right: 0, alignItems: "center" },
+  titleWrap: { position: "absolute", left: 0, right: 0, alignItems: "center" },
   titlePill: { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 16, paddingVertical: 8 },
   titleText: { color: colors.ink, fontFamily: font.sansBold, fontSize: 14 },
   titleSub: { color: colors.inkMuted, fontFamily: font.mono, fontSize: 11 },
-  cluster: { position: "absolute", right: 16, top: 96, gap: 8 },
+  cluster: { position: "absolute", gap: 8 },
   clusterBtn: { width: 44, height: 44, alignItems: "center", justifyContent: "center" },
+  clusterBtnDisabled: { opacity: 0.45 },
   zoomBox: { alignItems: "center" },
   zoomBtn: { width: 44, height: 44, alignItems: "center", justifyContent: "center" },
   zoomSep: { height: 1, width: 28, backgroundColor: "rgba(255,255,255,0.12)" },

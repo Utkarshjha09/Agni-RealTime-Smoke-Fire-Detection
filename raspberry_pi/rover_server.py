@@ -18,11 +18,14 @@ be exercised before the hardware is wired up.
 
 import asyncio
 import json
+import multiprocessing
 import os
 import secrets
-import signal
+import threading
 import time
 import uuid
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -34,6 +37,11 @@ try:
     from picamera2 import Picamera2
 except ImportError:  # Lets the service run on a development machine.
     Picamera2 = None
+
+try:
+    from libcamera import controls as libcamera_controls
+except ImportError:  # Only present alongside Picamera2.
+    libcamera_controls = None
 
 try:
     import RPi.GPIO as GPIO
@@ -51,12 +59,24 @@ ROVER_NAME = os.getenv("ROVER_NAME", "Ranger-01")
 DETECTOR_ENABLED = os.getenv("DETECTOR", "0") == "1"
 # 0.8s suits a Raspberry Pi 4; lower it on a Pi 5 for a faster refresh.
 DETECT_INTERVAL = float(os.getenv("DETECT_INTERVAL", "0.8"))
+# The model's input size, read here too so frames are shrunk to it before they
+# are copied to the detector process. Same variable and default as fire_detector.
+DETECT_FRAME_WIDTH = int(os.getenv("DETECT_IMGSZ", "320"))
 # Horizontal field of view of the camera, in degrees. The app needs this to turn a
 # detection's position in the frame into a real bearing for the 3D view.
 # Pi Camera v2 = 62.2, Camera v3 = 66, Camera v3 Wide = 102, HQ depends on the lens.
 CAMERA_HFOV_DEG = float(os.getenv("CAMERA_HFOV", "62.2"))
 TELEMETRY_INTERVAL = float(os.getenv("TELEMETRY_INTERVAL", "2.0"))
+# Frame rate of /stream.mjpg. 15 is smooth to drive by and leaves a Pi 4 enough
+# CPU for the detector; each frame is a 720p JPEG encode.
+STREAM_FPS = max(1.0, float(os.getenv("STREAM_FPS", "15")))
+# A frame that takes longer than this means the camera has hung. Ending the
+# stream lets the app show the camera as failed instead of a frozen picture.
+STREAM_FRAME_TIMEOUT = 3.0
 SIREN_HOLD = float(os.getenv("SIREN_HOLD", "5.0"))
+# A hard brake shorts the motors. Long enough to stop a small rover from full
+# speed, then it releases to a coast so the driver is not held braking.
+BRAKE_HOLD = 0.5
 # Ultrasonic range finder. Off until RANGE_TRIG_PIN and RANGE_ECHO_PIN are set;
 # see range_sensor.py for wiring and the voltage divider the ECHO pin needs.
 # 0.25s is four pings a second, fast enough to see an obstacle while driving
@@ -84,6 +104,18 @@ RIGHT_REVERSED = os.getenv("RIGHT_REVERSED", "0") == "1"
 FLASH_PIN = int(os.getenv("FLASH_PIN", "-1"))
 SIREN_PIN = int(os.getenv("SIREN_PIN", "-1"))
 QUALITY_DIMENSIONS = {"480p": (854, 480), "720p": (1280, 720), "1080p": (1920, 1080)}
+# White balance presets, by the names the app shows. Auto white balance guessed
+# badly in at least one room, turning a white wall pink, so a fixed preset is the
+# default and the app can switch it live.
+WHITE_BALANCE_MODES = ("auto", "daylight", "cloudy", "indoor", "tungsten", "fluorescent")
+CAMERA_AWB = os.getenv("CAMERA_AWB", "daylight").strip().lower()
+if CAMERA_AWB not in WHITE_BALANCE_MODES:
+    print(f"CAMERA_AWB={CAMERA_AWB!r} is not one of {WHITE_BALANCE_MODES}; using daylight.")
+    CAMERA_AWB = "daylight"
+# A libcamera tuning file, e.g. imx219_noir.json for a NoIR camera. A NoIR module
+# has no infrared filter and reads pink under the standard tuning, whatever the
+# white balance. Empty uses the tuning libcamera picks for the sensor.
+CAMERA_TUNING = os.getenv("CAMERA_TUNING", "").strip()
 
 
 def clamp(value: float, low: float = -1.0, high: float = 1.0) -> float:
@@ -117,19 +149,35 @@ def unauthorized() -> web.Response:
 # --------------------------------------------------------------------------
 
 class MotorDriver:
+    """The wheels, plus the flashlight and siren outputs.
+
+    The devices are independent of MOTOR_OUTPUT: a bench rover with the wheels
+    disabled can still test its flashlight. A device whose pin is -1 reports
+    itself unavailable, so the app hides its button instead of showing a toggle
+    that switches nothing.
+    """
+
     def __init__(self) -> None:
         self.enabled = MOTOR_OUTPUT and GPIO is not None
+        self.devices = {
+            name: pin for name, pin in (("flash", FLASH_PIN), ("siren", SIREN_PIN))
+            if pin >= 0 and GPIO is not None
+        }
+        self.device_state = {name: False for name in self.devices}
         self.left_pwm = None
         self.right_pwm = None
+
+        if self.enabled or self.devices:
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setwarnings(False)
+        for pin in self.devices.values():
+            GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
+
         if not self.enabled:
             print("Motor output is disabled. Set MOTOR_OUTPUT=1 after checking motor pins.")
             return
 
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setwarnings(False)
-        for pin in (LEFT_IN1, LEFT_IN2, LEFT_PWM, RIGHT_IN1, RIGHT_IN2, RIGHT_PWM, FLASH_PIN, SIREN_PIN):
-            if pin < 0:
-                continue
+        for pin in (LEFT_IN1, LEFT_IN2, LEFT_PWM, RIGHT_IN1, RIGHT_IN2, RIGHT_PWM):
             GPIO.setup(pin, GPIO.OUT)
         self.left_pwm = GPIO.PWM(LEFT_PWM, 1000)
         self.right_pwm = GPIO.PWM(RIGHT_PWM, 1000)
@@ -157,23 +205,41 @@ class MotorDriver:
         return left, right
 
     def stop(self) -> None:
+        """Cut power and let the wheels coast. What releasing the stick does."""
         if not self.enabled:
             return
         self._set_motor(LEFT_IN1, LEFT_IN2, self.left_pwm, 0)
         self._set_motor(RIGHT_IN1, RIGHT_IN2, self.right_pwm, 0)
 
-    def set_device(self, device: str, enabled: bool) -> None:
+    def brake(self) -> None:
+        """Short both motors through the driver so they stop hard.
+
+        Cutting power only lets the car coast, which felt identical to letting go
+        of the stick. With both inputs high and enable on, an L298N ties each
+        motor's terminals together and the motor's own back-EMF stops it.
+        """
         if not self.enabled:
             return
-        pin = FLASH_PIN if device == "flash" else SIREN_PIN
-        if pin >= 0:
-            GPIO.output(pin, enabled)
+        for in1, in2, pwm in ((LEFT_IN1, LEFT_IN2, self.left_pwm), (RIGHT_IN1, RIGHT_IN2, self.right_pwm)):
+            GPIO.output(in1, True)
+            GPIO.output(in2, True)
+            pwm.ChangeDutyCycle(100)
+
+    def set_device(self, device: str, enabled: bool) -> bool:
+        """Switch a device. False when it is not wired, so the caller can say so."""
+        pin = self.devices.get(device)
+        if pin is None:
+            return False
+        GPIO.output(pin, enabled)
+        self.device_state[device] = enabled
+        return True
 
     def close(self) -> None:
         self.stop()
         if self.enabled:
             self.left_pwm.stop()
             self.right_pwm.stop()
+        if self.enabled or self.devices:
             GPIO.cleanup()
 
 
@@ -181,19 +247,27 @@ class Camera:
     """Picamera2 when present, otherwise a webcam, otherwise a synthetic frame."""
 
     def __init__(self) -> None:
-        self.quality = "1080p"
+        self.quality = "720p"
+        self.white_balance = CAMERA_AWB
         self.source = "none"
         self.camera: Any = None
         self.capture: Any = None
+        # The app's frame requests and the detector both read from executor
+        # threads. cv2.VideoCapture is not safe to read from two threads at once.
+        self.lock = threading.Lock()
 
         if Picamera2 is not None:
             try:
-                self.camera = Picamera2()
-                config = self.camera.create_video_configuration(main={"size": QUALITY_DIMENSIONS["1080p"], "format": "RGB888"})
-                self.camera.configure(config)
+                if CAMERA_TUNING:
+                    self.camera = Picamera2(tuning=Picamera2.load_tuning_file(CAMERA_TUNING))
+                    print(f"Camera tuning: {CAMERA_TUNING}")
+                else:
+                    self.camera = Picamera2()
+                self.camera.configure(self._full_view_config())
                 self.camera.start()
                 time.sleep(1)
                 self.source = "picamera2"
+                self.set_white_balance(CAMERA_AWB)
             except Exception as error:  # noqa: BLE001 - fall through to the webcam
                 print(f"Picamera2 unavailable ({error}); trying a webcam.")
                 self.camera = None
@@ -209,14 +283,43 @@ class Camera:
 
         print(f"Camera source: {self.source}")
 
+    def _full_view_config(self) -> Any:
+        """A video configuration on a sensor mode that sees the whole field of view.
+
+        Left to choose, libcamera picks the mode closest to the 1920x1080 we ask for.
+        On the Camera Module v2 that is a centre crop of the sensor, about 39 of its
+        62.2 degrees: the model never sees the outer third of the scene, and the map,
+        which turns box positions into bearings with CAMERA_HFOV, puts every fire at
+        the wrong angle. Measured on a Pi 4 with an imx219, 2026-10-10.
+        """
+        main = {"size": QUALITY_DIMENSIONS["1080p"], "format": "RGB888"}
+        try:
+            modes = [mode for mode in self.camera.sensor_modes if mode.get("crop_limits") and mode.get("size")]
+            widest = max(mode["crop_limits"][2] for mode in modes)
+            full_view = [mode for mode in modes if mode["crop_limits"][2] >= widest]
+            # The smallest full-view mode that still fills 720p: binned modes are
+            # faster to read out and lose nothing the stream can show.
+            big_enough = [mode for mode in full_view if mode["size"][0] >= 1280] or full_view
+            mode = min(big_enough, key=lambda item: item["size"][0] * item["size"][1])
+            config = self.camera.create_video_configuration(
+                main=main, sensor={"output_size": mode["size"], "bit_depth": mode["bit_depth"]},
+            )
+            print(f"Camera sensor mode: {mode['size'][0]}x{mode['size'][1]}, full field of view")
+            return config
+        except Exception as error:  # noqa: BLE001 - a cropped view beats no camera
+            print(f"Could not select a full-view sensor mode ({error}); using the default, which may crop.")
+            return self.camera.create_video_configuration(main=main)
+
     def raw_frame(self) -> Any:
         """Latest frame as a numpy array at the selected quality."""
         width, height = QUALITY_DIMENSIONS[self.quality]
 
         if self.source == "picamera2":
-            array = self.camera.capture_array("main")
+            with self.lock:
+                array = self.camera.capture_array("main")
         elif self.source == "webcam":
-            ok, array = self.capture.read()
+            with self.lock:
+                ok, array = self.capture.read()
             if not ok:
                 raise RuntimeError("Webcam did not return a frame")
         else:
@@ -240,6 +343,27 @@ class Camera:
         if quality in QUALITY_DIMENSIONS:
             self.quality = quality
 
+    @property
+    def white_balance_available(self) -> bool:
+        return self.source == "picamera2" and libcamera_controls is not None
+
+    def set_white_balance(self, mode: str) -> bool:
+        """Apply a white balance preset live. False when this camera cannot."""
+        if mode not in WHITE_BALANCE_MODES or not self.white_balance_available:
+            return False
+        modes = libcamera_controls.AwbModeEnum
+        enum = {
+            "auto": modes.Auto, "daylight": modes.Daylight, "cloudy": modes.Cloudy,
+            "indoor": modes.Indoor, "tungsten": modes.Tungsten, "fluorescent": modes.Fluorescent,
+        }[mode]
+        try:
+            self.camera.set_controls({"AwbEnable": True, "AwbMode": enum})
+        except Exception as error:  # noqa: BLE001 - a colour preset is never worth the camera
+            print(f"White balance {mode} not applied: {error}")
+            return False
+        self.white_balance = mode
+        return True
+
     def close(self) -> None:
         if self.source == "picamera2":
             self.camera.stop()
@@ -261,7 +385,10 @@ class RoverState:
     right_power: float = 0.0
     settings: dict[str, Any] = None
     siren_until: float = 0.0
-    siren_on: bool = False
+    brake_until: float = 0.0
+    # Last reading, so a device change can push telemetry at once without
+    # waiting on BATTERY_CMD.
+    battery: int = VALUE_UNAVAILABLE
     suppressed_detections: int = 0
     inference_ms: float = 0.0
     detector: Any = None
@@ -272,7 +399,12 @@ class RoverState:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def __post_init__(self) -> None:
-        self.settings = {"detectionSensitivity": 74, "autoSiren": True, "showLocation": True, "cameraQuality": "1080p"}
+        # 720p by default: a Pi 4 encodes and sends it several times faster than
+        # 1080p, which is the difference between a feed you can drive by and not.
+        self.settings = {
+            "detectionSensitivity": 74, "autoSiren": True, "showLocation": True,
+            "cameraQuality": "720p", "whiteBalance": CAMERA_AWB,
+        }
 
     async def broadcast(self, payload: dict[str, Any]) -> None:
         dead: list[web.WebSocketResponse] = []
@@ -287,16 +419,30 @@ class RoverState:
         for client in dead:
             self.clients.discard(client)
 
+    async def push_telemetry(self) -> None:
+        """Send telemetry now, so the app sees a device change without waiting."""
+        await self.broadcast(telemetry_payload(self))
+
     async def stop(self) -> None:
         self.left_power = self.right_power = 0.0
+        self.brake_until = 0.0
         self.motors.stop()
 
-    def hold_siren(self, seconds: float) -> None:
+    async def brake(self) -> None:
+        """Hard stop, released to a coast by the watchdog after BRAKE_HOLD."""
+        self.left_power = self.right_power = 0.0
+        self.last_command = 0.0
+        self.motors.brake()
+        self.brake_until = time.monotonic() + BRAKE_HOLD
+
+    async def hold_siren(self, seconds: float) -> None:
         """Extend the siren deadline. Overlapping fires never cut each other short."""
+        if "siren" not in self.motors.devices:
+            return
         self.siren_until = max(self.siren_until, time.monotonic() + seconds)
-        if not self.siren_on:
-            self.siren_on = True
+        if not self.motors.device_state["siren"]:
             self.motors.set_device("siren", True)
+            await self.push_telemetry()
 
 
 def read_signal_db() -> int:
@@ -361,11 +507,12 @@ def range_payload(reading: Any) -> dict[str, Any]:
     }
 
 
-def telemetry_payload(state: RoverState, battery: int) -> dict[str, Any]:
+def telemetry_payload(state: RoverState) -> dict[str, Any]:
+    devices = state.motors.device_state
     return {
         "type": "telemetry",
         "roverName": ROVER_NAME,
-        "batteryPercent": battery,
+        "batteryPercent": state.battery,
         "signalDb": read_signal_db(),
         # No GPS module is wired in; the app renders this honestly rather than faking a fix.
         "gpsLocked": False,
@@ -376,6 +523,14 @@ def telemetry_payload(state: RoverState, battery: int) -> dict[str, Any]:
         "motorOutput": state.motors.enabled,
         "cameraSource": state.camera.source,
         "cameraHfovDeg": CAMERA_HFOV_DEG,
+        # The app offers white balance only for a camera that can take it.
+        "whiteBalanceAvailable": state.camera.white_balance_available,
+        # Available means a pin is wired. The on/off state is the rover's, not
+        # the app's, so an auto-siren starting or timing out shows up too.
+        "flashAvailable": "flash" in devices,
+        "flashOn": devices.get("flash", False),
+        "sirenAvailable": "siren" in devices,
+        "sirenOn": devices.get("siren", False),
         **range_telemetry(state),
     }
 
@@ -415,7 +570,7 @@ async def publish_detection(state: RoverState, data: dict[str, Any]) -> dict[str
         "confirmedBySensor": bool(data.get("confirmedBySensor", False)),
     }
     if detection["kind"] == "fire" and state.settings["autoSiren"]:
-        state.hold_siren(SIREN_HOLD)
+        await state.hold_siren(SIREN_HOLD)
     await state.broadcast({"type": "detection", "detection": detection})
     return {"ok": True, "detection": detection}
 
@@ -429,8 +584,11 @@ async def detection_handler(request: web.Request) -> web.Response:
         data = await request.json()
     except json.JSONDecodeError:
         return web.json_response({"error": "body must be JSON"}, status=400)
+    if not isinstance(data, dict):
+        return web.json_response({"error": "body must be a JSON object"}, status=400)
 
-    data.setdefault("snapshotUrl", f"{request.scheme}://{request.host}/frame.jpg")
+    # No default snapshotUrl. /frame.jpg is the live view, not a picture of what
+    # was detected, and the app would show it as the detection's snapshot.
     try:
         result = await publish_detection(state, data)
     except (ValueError, TypeError) as error:
@@ -451,6 +609,46 @@ async def frame_handler(request: web.Request) -> web.Response:
         return web.Response(body=body, content_type="image/jpeg", headers={"Cache-Control": "no-store"})
     except Exception as error:  # noqa: BLE001 - report to the app instead of a 500 page
         return web.json_response({"error": str(error)}, status=503)
+
+
+async def stream_handler(request: web.Request) -> web.StreamResponse:
+    """Continuous MJPEG video, the way a browser shows a webcam.
+
+    Polling /frame.jpg makes the phone swap one picture for the next several times
+    a second, and Android blanks an image while it swaps, so the feed blinked. A
+    stream is one long response the app draws frame by frame, with no swap.
+    """
+    if not authorized(request):
+        return unauthorized()
+    state: RoverState = request.app["state"]
+    response = web.StreamResponse(headers={
+        "Content-Type": "multipart/x-mixed-replace; boundary=frame",
+        "Cache-Control": "no-store",
+        # The app reads this from a local WebView page, which has no origin of
+        # its own. Without this header the page may not read the body. The
+        # token above still gates every request.
+        "Access-Control-Allow-Origin": "*",
+    })
+    await response.prepare(request)
+    loop = asyncio.get_running_loop()
+    interval = 1.0 / STREAM_FPS
+    try:
+        while True:
+            started = time.monotonic()
+            try:
+                jpeg = await asyncio.wait_for(loop.run_in_executor(None, state.camera.frame), STREAM_FRAME_TIMEOUT)
+            except Exception as error:  # noqa: BLE001 - end this stream, never the server
+                print(f"Stream ended: {type(error).__name__}: {error}")
+                break
+            await response.write(
+                b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                + str(len(jpeg)).encode() + b"\r\n\r\n" + jpeg + b"\r\n"
+            )
+            await asyncio.sleep(max(0.0, interval - (time.monotonic() - started)))
+    except ConnectionResetError:
+        # The viewer went away. Nothing to clean up: each stream owns no state.
+        pass
+    return response
 
 
 async def status_handler(request: web.Request) -> web.Response:
@@ -478,57 +676,69 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
     ws = web.WebSocketResponse(heartbeat=10)
     await ws.prepare(request)
     state.clients.add(ws)
-    await ws.send_json(telemetry_payload(state, await read_battery_percent()))
-    await ws.send_json({"type": "settings", "settings": state.settings})
+    # finally, because a send failing mid-session must still deregister this
+    # client and, if it was the last one, cut the motors.
+    try:
+        await ws.send_json(telemetry_payload(state))
+        await ws.send_json({"type": "settings", "settings": state.settings})
 
-    async for message in ws:
-        if message.type != web.WSMsgType.TEXT:
-            continue
-        try:
-            command = json.loads(message.data)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(command, dict):
-            continue
+        async for message in ws:
+            if message.type != web.WSMsgType.TEXT:
+                continue
+            try:
+                command = json.loads(message.data)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(command, dict):
+                continue
 
-        kind = command.get("type")
-        try:
-            if kind == "drive":
-                throttle = clamp(float(command.get("throttle", 0)))
-                steering = clamp(float(command.get("steering", 0)))
-                state.left_power, state.right_power = state.motors.drive(throttle, steering, bool(command.get("sprint", False)))
-                state.last_command = time.monotonic()
-            elif kind == "brake":
-                await state.stop()
-            elif kind == "device":
-                device = command.get("device")
-                if device in ("flash", "siren"):
-                    enabled = bool(command.get("enabled", False))
-                    state.motors.set_device(device, enabled)
-                    if device == "siren":
-                        # A manual siren toggle wins over an auto-siren hold.
-                        state.siren_on = enabled
-                        state.siren_until = 0.0
-            elif kind == "settings":
-                incoming = command.get("settings", {})
-                if isinstance(incoming, dict):
-                    sensitivity = incoming.get("detectionSensitivity", state.settings["detectionSensitivity"])
-                    state.settings["detectionSensitivity"] = max(0, min(100, int(sensitivity)))
-                    state.settings["autoSiren"] = bool(incoming.get("autoSiren", state.settings["autoSiren"]))
-                    state.settings["showLocation"] = bool(incoming.get("showLocation", state.settings["showLocation"]))
-                    quality = incoming.get("cameraQuality", state.settings["cameraQuality"])
-                    if quality in QUALITY_DIMENSIONS:
-                        state.settings["cameraQuality"] = quality
-                        state.camera.set_quality(quality)
-                await ws.send_json({"type": "settings", "settings": state.settings})
-        except (TypeError, ValueError):
-            # One malformed packet must not end a driving session.
-            continue
-
-    state.clients.discard(ws)
-    # Only stop the motors when the last operator disconnects.
-    if not state.clients:
-        await state.stop()
+            kind = command.get("type")
+            try:
+                if kind == "drive":
+                    throttle = clamp(float(command.get("throttle", 0)))
+                    steering = clamp(float(command.get("steering", 0)))
+                    if state.brake_until and throttle == 0 and steering == 0:
+                        # Letting go of the stick just after BRAKE sends a zero
+                        # command; that must not cut the brake short.
+                        continue
+                    # Driving again takes over from a brake at once.
+                    state.brake_until = 0.0
+                    state.left_power, state.right_power = state.motors.drive(throttle, steering, bool(command.get("sprint", False)))
+                    state.last_command = time.monotonic()
+                elif kind == "brake":
+                    await state.brake()
+                elif kind == "device":
+                    device = command.get("device")
+                    if device in ("flash", "siren"):
+                        if state.motors.set_device(device, bool(command.get("enabled", False))) and device == "siren":
+                            # A manual siren toggle wins over an auto-siren hold.
+                            state.siren_until = 0.0
+                        # Always answer, so a toggle for an unwired device snaps
+                        # back in the app instead of looking switched on.
+                        await state.push_telemetry()
+                elif kind == "settings":
+                    incoming = command.get("settings", {})
+                    if isinstance(incoming, dict):
+                        sensitivity = incoming.get("detectionSensitivity", state.settings["detectionSensitivity"])
+                        state.settings["detectionSensitivity"] = max(0, min(100, int(sensitivity)))
+                        state.settings["autoSiren"] = bool(incoming.get("autoSiren", state.settings["autoSiren"]))
+                        state.settings["showLocation"] = bool(incoming.get("showLocation", state.settings["showLocation"]))
+                        quality = incoming.get("cameraQuality", state.settings["cameraQuality"])
+                        if quality in QUALITY_DIMENSIONS:
+                            state.settings["cameraQuality"] = quality
+                            state.camera.set_quality(quality)
+                        balance = incoming.get("whiteBalance")
+                        if balance in WHITE_BALANCE_MODES and state.camera.set_white_balance(balance):
+                            state.settings["whiteBalance"] = balance
+                    await ws.send_json({"type": "settings", "settings": state.settings})
+            except (TypeError, ValueError):
+                # One malformed packet must not end a driving session.
+                continue
+    finally:
+        state.clients.discard(ws)
+        # Only stop the motors when the last operator disconnects.
+        if not state.clients:
+            await state.stop()
     return ws
 
 
@@ -538,59 +748,110 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
 
 async def watchdog(state: RoverState) -> None:
     while True:
-        now = time.monotonic()
-        if state.last_command and now - state.last_command > CONTROL_TIMEOUT:
-            await state.stop()
-            state.last_command = 0.0
-        if state.siren_on and state.siren_until and now > state.siren_until:
-            state.siren_on = False
-            state.siren_until = 0.0
-            state.motors.set_device("siren", False)
+        try:
+            now = time.monotonic()
+            if state.last_command and now - state.last_command > CONTROL_TIMEOUT:
+                await state.stop()
+                state.last_command = 0.0
+            if state.brake_until and now > state.brake_until:
+                await state.stop()
+            if state.siren_until and now > state.siren_until:
+                state.siren_until = 0.0
+                state.motors.set_device("siren", False)
+                await state.push_telemetry()
+        except Exception as error:  # noqa: BLE001 - the watchdog must outlive any one failure
+            print(f"Watchdog error: {type(error).__name__}: {error}")
         await asyncio.sleep(0.05)
 
 
 async def telemetry_loop(state: RoverState) -> None:
     while True:
-        battery = await read_battery_percent()
-        await state.broadcast(telemetry_payload(state, battery))
+        try:
+            state.battery = await read_battery_percent()
+            await state.push_telemetry()
+        except Exception as error:  # noqa: BLE001 - keep reporting on the next tick
+            print(f"Telemetry error: {type(error).__name__}: {error}")
         await asyncio.sleep(TELEMETRY_INTERVAL)
 
 
-async def detector_loop(state: RoverState) -> None:
-    """Run the on-device model against the live camera and publish what it finds."""
-    from fire_detector import DetectorUnavailable, FireDetector
+def frame_for_detector(frame: Any) -> Any:
+    """The frame shrunk to the model's input width before it crosses to the detector.
 
-    loop = asyncio.get_running_loop()
-    detector = FireDetector()
+    The model letterboxes to DETECT_IMGSZ anyway, so this loses nothing, and a
+    640-wide frame is a quarter of the bytes of a 1280-wide one to copy between
+    processes. Boxes come back in percent, so the scale does not matter to them.
+    """
+    height, width = frame.shape[:2]
+    if width <= DETECT_FRAME_WIDTH:
+        return frame
+    return cv2.resize(frame, (DETECT_FRAME_WIDTH, round(height * DETECT_FRAME_WIDTH / width)), interpolation=cv2.INTER_AREA)
+
+
+def start_detector_process() -> ProcessPoolExecutor:
+    # spawn, not fork: forking a process that has the camera open copies its
+    # threads' state into the child, which is how a camera ends up wedged.
+    return ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"))
+
+
+async def load_detector(state: RoverState, pool: ProcessPoolExecutor) -> bool:
+    from fire_detector import DetectorUnavailable, worker_load
+
     try:
-        await loop.run_in_executor(None, detector.load)
+        classes = await asyncio.get_running_loop().run_in_executor(pool, worker_load)
     except DetectorUnavailable as error:
         state.detector_error = str(error)
         print(f"Fire detector disabled: {error}")
-        return
+        return False
     except Exception as error:  # noqa: BLE001 - never take the server down with it
         state.detector_error = f"{type(error).__name__}: {error}"
         print(f"Fire detector failed to load: {error}")
-        return
-
-    state.detector = detector
+        return False
+    print(f"Fire detector running in its own process, classes={classes}")
+    state.detector = pool
     state.detector_error = ""
+    return True
 
-    while True:
-        started = time.monotonic()
-        try:
-            frame = await loop.run_in_executor(None, state.camera.raw_frame)
-            detections = await loop.run_in_executor(None, detector.detect, frame)
-            state.inference_ms = detector.last_inference_ms
-            for detection in detections:
-                # No snapshotUrl: the rover cannot know which address the phone
-                # reaches it on, and a 127.0.0.1 link would be dead on the phone.
-                # The app shows a kind icon instead of a broken thumbnail.
-                await publish_detection(state, detection)
-        except Exception as error:  # noqa: BLE001 - keep the rover driveable
-            state.detector_error = f"{type(error).__name__}: {error}"
-        elapsed = time.monotonic() - started
-        await asyncio.sleep(max(0.0, DETECT_INTERVAL - elapsed))
+
+async def detector_loop(state: RoverState) -> None:
+    """Run the on-device model against the live camera and publish what it finds.
+
+    The model runs in a separate process; see the note in fire_detector.py.
+    """
+    from fire_detector import worker_detect
+
+    loop = asyncio.get_running_loop()
+    pool = start_detector_process()
+    try:
+        if not await load_detector(state, pool):
+            return
+        while True:
+            started = time.monotonic()
+            try:
+                frame = await loop.run_in_executor(None, lambda: frame_for_detector(state.camera.raw_frame()))
+                detections, inference_ms = await loop.run_in_executor(pool, worker_detect, frame)
+                state.inference_ms = inference_ms
+                state.detector_error = ""
+                for detection in detections:
+                    # No snapshotUrl: the rover cannot know which address the phone
+                    # reaches it on, and a 127.0.0.1 link would be dead on the phone.
+                    # The app shows a kind icon instead of a broken thumbnail.
+                    await publish_detection(state, detection)
+            except BrokenProcessPool:
+                # The detector process died (out of memory, a native crash). The
+                # rover keeps driving; bring the model back in a fresh process.
+                state.detector = None
+                state.detector_error = "The detector process stopped; restarting it."
+                print(state.detector_error)
+                pool.shutdown(wait=False, cancel_futures=True)
+                pool = start_detector_process()
+                await asyncio.sleep(2)
+                await load_detector(state, pool)
+            except Exception as error:  # noqa: BLE001 - keep the rover driveable
+                state.detector_error = f"{type(error).__name__}: {error}"
+            elapsed = time.monotonic() - started
+            await asyncio.sleep(max(0.0, DETECT_INTERVAL - elapsed))
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 async def range_loop(state: RoverState) -> None:
@@ -658,6 +919,7 @@ def make_app() -> web.Application:
     app = web.Application()
     app["state"] = RoverState(MotorDriver(), Camera(), set())
     app.router.add_get("/frame.jpg", frame_handler)
+    app.router.add_get("/stream.mjpg", stream_handler)
     app.router.add_get("/status", status_handler)
     app.router.add_post("/detections", detection_handler)
     app.router.add_get("/control", websocket_handler)
@@ -673,13 +935,6 @@ if __name__ == "__main__":
     if DETECTOR_ENABLED:
         print("On-device fire and smoke detection is enabled (DETECTOR=1).")
 
-    app = make_app()
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        for signum in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(signum, lambda: asyncio.create_task(app["state"].stop()))
-    except NotImplementedError:
-        # Windows does not support add_signal_handler; Ctrl+C still stops the server.
-        pass
-    web.run_app(app, host="0.0.0.0", port=HTTP_PORT, loop=loop)
+    # run_app turns SIGINT and SIGTERM into a graceful exit, which runs
+    # stop_background_tasks and so stops the motors before the process ends.
+    web.run_app(make_app(), host="0.0.0.0", port=HTTP_PORT)

@@ -7,6 +7,7 @@ import { colors, font, radius } from "../theme";
 import type { AppTab, Detection } from "../domain/robot";
 import { detectionColor, detectionLabel, relativeTime } from "../domain/detectionView";
 import { useRobot } from "../features/robot/RobotContext";
+import { useScreenInsets } from "../components/useOrientation";
 
 const filters = ["All", "Fire", "Smoke"] as const;
 type Filter = (typeof filters)[number];
@@ -17,6 +18,7 @@ function KindIcon({ kind, size, color }: { kind: Detection["kind"]; size: number
 
 export default function HistoryScreen({ landscape = false, onNavigate }: { landscape?: boolean; onNavigate?: (tab: AppTab) => void }) {
   const { clearDetections, connectionState, connectionMessage, detections, settings } = useRobot();
+  const insets = useScreenInsets(landscape);
   const [filter, setFilter] = useState<Filter>("All");
   const [selected, setSelected] = useState<Detection | null>(null);
   const [now, setNow] = useState(Date.now());
@@ -41,7 +43,7 @@ export default function HistoryScreen({ landscape = false, onNavigate }: { lands
     <AppGround>
       <ScrollView
         showsVerticalScrollIndicator={false}
-        contentContainerStyle={{ paddingTop: 44, paddingBottom: landscape ? 24 : 96, paddingLeft: landscape ? 76 : 16, paddingRight: 16 }}
+        contentContainerStyle={{ paddingTop: insets.top, paddingBottom: insets.bottom + 8, paddingLeft: insets.left, paddingRight: insets.right }}
       >
         <View style={styles.headRow}>
           <Text style={styles.h1}>Alerts</Text>

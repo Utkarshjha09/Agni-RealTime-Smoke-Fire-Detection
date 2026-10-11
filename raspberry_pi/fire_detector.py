@@ -31,6 +31,11 @@ NMS_IOU = float(os.getenv("DETECT_NMS_IOU", "0.45"))
 # so one fire updates one alert instead of creating a new one every frame.
 TRACK_IOU = float(os.getenv("DETECT_TRACK_IOU", "0.3"))
 TRACK_TTL = float(os.getenv("DETECT_TRACK_TTL", "3.0"))
+# Threads the model may use. NCNN and PyTorch each default to one per core; on a
+# Pi 4 those four, at low priority beside the video encoder, kept waiting on one
+# another, and a 0.4 s pass took 6.5 s (measured 2026-10-11). Two leaves the
+# camera and the stream a core each.
+DETECT_THREADS = max(1, int(os.getenv("DETECT_THREADS", "2")))
 CANDIDATE_WEIGHT_FILES = ("best.pt", "yolov10_fire_smoke.pt", "model.pt", "pytorch_model.bin")
 
 
@@ -139,6 +144,17 @@ class FireDetector:
         self._tracks.append(track)
         return track.id
 
+    def _limit_ncnn_threads(self) -> None:
+        """Cap NCNN's threads. ultralytics never sets them, so NCNN takes every core.
+
+        The network only exists once the first predict() has built the predictor;
+        NCNN reads the option on each pass, so setting it then takes effect.
+        """
+        predictor = getattr(self.model, "predictor", None)
+        net = getattr(getattr(getattr(predictor, "model", None), "backend", None), "net", None)
+        if net is not None and net.opt.num_threads != DETECT_THREADS:
+            net.opt.num_threads = DETECT_THREADS
+
     def _expire_tracks(self, now: float) -> None:
         self._tracks = [track for track in self._tracks if now - track.last_seen <= TRACK_TTL]
 
@@ -160,6 +176,7 @@ class FireDetector:
             verbose=False,
         )
         self.last_inference_ms = round((time.perf_counter() - started) * 1000, 1)
+        self._limit_ncnn_threads()
 
         now = time.monotonic()
         self._expire_tracks(now)
@@ -194,3 +211,42 @@ class FireDetector:
                     "confirmedBySensor": False,
                 })
         return detections
+
+
+# -- the detector process ----------------------------------------------------
+#
+# rover_server.py runs the model in a process of its own through these two
+# functions. In the server's process the NCNN inference held the interpreter
+# lock for its whole ~0.4 s pass, which froze the event loop: measured on a Pi 4,
+# even /status took 340 ms, the stream fell to 2 fps, and drive commands queued
+# behind the model. A separate process has its own lock and its own core.
+
+# Above the server's priority, so video and drive commands win the CPU and the
+# model gets what is left. A Pi 4 has cores to spare for it either way.
+DETECTOR_NICE = 10
+
+_worker: FireDetector | None = None
+
+
+def worker_load() -> list[str]:
+    """Load the model in the detector process. Returns its class names."""
+    global _worker
+    try:
+        os.nice(DETECTOR_NICE)
+    except (AttributeError, OSError):  # no nice() on Windows; the split still helps
+        pass
+    import torch
+
+    # PyTorch does the pre-processing, with its own pool of one thread per core.
+    torch.set_num_threads(DETECT_THREADS)
+    _worker = FireDetector()
+    _worker.load()
+    return list(_worker.names.values())
+
+
+def worker_detect(frame: Any) -> tuple[list[dict[str, Any]], float]:
+    """One inference pass in the detector process: detections and the time it took."""
+    if _worker is None:
+        raise DetectorUnavailable("the detector process has not loaded a model")
+    detections = _worker.detect(frame)
+    return detections, _worker.last_inference_ms
